@@ -17,9 +17,10 @@ published here in enough detail that anyone can:
 1. **Train** a model that conforms to it (any framework — a reference
    PyTorch implementation is provided in `modeling_nanity.py`, but the spec
    itself is framework-independent), and
-2. **Export** it to a GGUF file NEON will load, using the exact tensor names
-   and metadata keys below (`convert_to_gguf.py` does this mechanically from
-   a `modeling_nanity.py` checkpoint).
+2. **Export** it to a file NEON will load — either a GGUF file or a `.nctr`
+   file (§2) — using the exact tensor names and metadata keys below
+   (`train_nanity_fixed.py`'s `export_gguf()` / `export_nctr()` do this
+   mechanically from a `modeling_nanity.py` checkpoint).
 
 A file that doesn't declare `general.architecture = "nanity"` isn't
 rejected by some compatibility check — it simply isn't a NANITY model, in
@@ -59,10 +60,25 @@ runtime never has to guess.
 
 ## 2. Container format
 
-NANITY models are distributed as **GGUF v2 or v3** files — the same binary
-container format used elsewhere in the GGUF ecosystem (magic `"GGUF"`,
-little-endian, mmap-friendly). NANITY does not redefine the container; it
-defines what must be inside one.
+NANITY models are distributed in one of two binary containers — **GGUF**
+or **`.nctr`** — chosen by the publisher, not mandated by the runtime.
+NEON determines which one it's looking at by sniffing the file's first 4
+bytes (`"GGUF"` or `"NCTR"`), never by trusting the file extension, and
+dispatches to the matching loader (`GGUFLoader` in `rawllm_loader.hpp`, or
+`NCTRLoader` in `rawllm_nctr_loader.hpp`). Both loaders populate the same
+internal tensor/config structures, so everything from §3 onward —
+required metadata, required tensors, the computation graph, RoPE,
+tokenizer handling, quantization — applies identically regardless of
+which container a given file uses. Which container to publish in is a
+distribution decision, not an architecture decision, and doesn't touch
+`nanity.spec_version` at all (see the versioning note at the end of §2.2).
+
+### 2.1 GGUF
+
+The same binary container format used elsewhere in the GGUF ecosystem
+(magic `"GGUF"`, little-endian, mmap-friendly, generic tagged
+key-value metadata + named tensor table). NANITY does not redefine the
+container; it defines what must be inside one (§3, §4).
 
 Two facts about GGUF's tensor-shape convention matter for §4 below:
 
@@ -74,9 +90,65 @@ Two facts about GGUF's tensor-shape convention matter for §4 below:
   `(out_features, in_features)`, therefore has `ne = [in_features,
   out_features]` — i.e. `ne` is the *reverse* of the PyTorch shape tuple,
   and the raw bytes are identical either way (just relabeled axes). Every
-  shape in §4 is given in this `ne` form. `convert_to_gguf.py` handles this
+  shape in §4 is given in this `ne` form. `export_gguf()` handles this
   conversion automatically; you only need to think about it if you're
   writing your own exporter.
+
+GGUF is the right choice for a publisher who wants to share a runnable
+model without also publishing how it was trained — the file carries
+weights and architecture metadata only. Nothing about the container
+requires or implies anything about training provenance.
+
+### 2.2 `.nctr`
+
+A fixed-header container purpose-built for NANITY, used when a publisher
+wants the release to be **fully reproducible** — not just "here are the
+weights" (which GGUF already covers), but a verifiable account of how
+they were produced: what data, what tokenizer, what optimizer settings,
+how many steps.
+
+Where GGUF's generic key-value stream exists because GGUF has to support
+an open-ended set of architectures, `.nctr` doesn't need it: NANITY is one
+fixed architecture, so the header is a **positional struct**, not tagged
+KV pairs — read in a single fixed-size copy, no key lookups, no per-value
+type dispatch. Tensor identity is likewise positional rather than
+name-string based: given `n_layer` and two flag bits (`use_swiglu`,
+`has_output_weight`), the full ordered tensor list (§4's table, in order)
+is already fully determined, so nothing on disk needs to spell out
+`"blk.3.attn_q.weight"` — table position 3 always means the same tensor
+§4 says it must be.
+
+**Layout** (see `rawllm_nctr_loader.hpp::NCTRHeader` for the authoritative
+byte-for-byte struct):
+
+| Section | Contents |
+|---|---|
+| Header (116 bytes, fixed offset 0) | Magic `"NCTR"`, a **container `format_version`** (independent of `nanity.spec_version` — see below), every §3 metadata value as a typed field (no key strings), a `flags` word (SwiGLU / tied-output-weight / optimizer-state-present bits), and byte offsets+lengths for the three sections below. |
+| Manifest | UTF-8 JSON. Training provenance: dataset recipe (source, revision, content hash — a reference, not the raw data itself), tokenizer/base-weight references (HF repo + revision + content hash), optimizer hyperparameters, step count, a convergence snapshot (final loss, grad norm), and the reproducibility environment (seed, precision, framework version). This is what makes a `.nctr` release reproducible rather than just downloadable. |
+| Tokenizer | UTF-8 JSON: `{"tokens": [...], "merges": [...], "bos_id", "eos_id", "unk_id"}` — the same information §7 describes for GGUF's `tokenizer.ggml.*` keys, just JSON instead of GGUF key-value pairs. |
+| Tensor table + data | One `{quant_type: u32, data_offset: u64, nbytes: u64}` triple per tensor, in the fixed positional order above, followed by the raw tensor bytes. |
+
+Optionally, a **second** table in the same `{quant_type, offset, nbytes}`
+shape carries real AdamW optimizer moment tensors when
+`flags.has_optimizer_state` is set. This is what lets someone fork a
+model and resume training from an exact point, rather than only being
+able to re-run the recipe from scratch with the manifest's hyperparameters
+alone. It's opt-in per publish — it roughly triples the file's size — so
+most `.nctr` releases will leave it unset.
+
+`.nctr` is the right choice for a publisher who wants a release that's
+reproducible end-to-end: someone else should be able to re-derive an
+equivalent model from the manifest alone, and, if optimizer state was
+included, resume training from exactly where it left off.
+
+**Container version vs. spec version.** `.nctr`'s header `format_version`
+and `nanity.spec_version` (§3) are deliberately two different numbers on
+two different axes. `format_version` versions the *container layout* —
+the byte offsets and section shapes described above. `nanity.spec_version`
+versions the *architecture* (§4–§6), identically to what it already means
+for a GGUF file. Bumping one never implies bumping the other: a
+`format_version` change means "the bytes are laid out differently on
+disk," not "the model computes something different," and vice versa.
 
 ## 3. Required metadata keys
 
@@ -185,6 +257,11 @@ exactly this formula, and must keep matching each other if either changes.
 
 ## 7. Tokenizer
 
+This section describes GGUF's realization of tokenizer data; §2.2 covers
+`.nctr`'s (a JSON section carrying the same information under different
+field names) — both are container-level conventions, not NANITY-specific
+ones, so nothing here affects §4–§6.
+
 Standard GGUF tokenizer metadata is used as-is (this is container-level, not
 NANITY-specific): `tokenizer.ggml.tokens` (string array), plus
 `tokenizer.ggml.bos_token_id` / `eos_token_id` / `unknown_token_id`
@@ -200,26 +277,31 @@ greedy matcher.
 `F16`, `BF16`, `Q8_0`, `Q4_0`, `Q4_1`, `Q5_0`, `Q5_1`, `Q4_K`, `Q5_K`,
 `Q6_K`. `Q2_K`, `Q3_K`, `Q8_1`, and `IQ4_NL` are recognized by the GGUF
 reader but not yet wired into the dequantizer and will throw a clear error
-if used. `convert_to_gguf.py` currently writes `F32` only — quantized
-export is a useful follow-up but isn't required to get a model running.
+if used. `export_gguf()` currently writes `F32`/`F16` (§2.1); `export_nctr()`
+currently writes `F32` only (§2.2) — quantized export for either container
+is a useful follow-up but isn't required to get a model running.
 
 ## 9. Reference implementation
 
 | File | Role |
 |---|---|
 | `modeling_nanity.py` | PyTorch reference implementation — train a model with this. |
-| `convert_to_gguf.py` | Exports a `modeling_nanity.py` checkpoint to a NANITY GGUF file. |
-| `rawllm_loader.hpp` | `GGUFLoader::validate_config()` — checks a file against §3/§4. |
-| `rawllm_forward.hpp` | CPU reference forward pass implementing §5/§6. |
+| `train_nanity_fixed.py` | Training loop; `export_gguf()` / `export_nctr()` export a checkpoint to either container (§2.1/§2.2). |
+| `rawllm_loader.hpp` | `GGUFLoader::validate_config()` — checks a GGUF file against §3/§4. |
+| `rawllm_nctr_loader.hpp` | `NCTRLoader::validate_config()` — the same checks, for a `.nctr` file (§2.2). |
+| `rawllm_forward.hpp` | CPU reference forward pass implementing §5/§6, shared by both loaders. |
 
-These two pairs (Python training-side, C++ inference-side) are independent
-implementations of the *same* spec — agreement between them is what makes
-a model "load correctly," not a code dependency between the files.
+These are independent implementations of the same spec on both sides
+(Python training/export, C++ loading/inference) — agreement between them,
+not a code dependency, is what makes a model load correctly, regardless
+of which container it's stored in.
 
 ## 10. Versioning policy
 
 `nanity.spec_version` exists so this can change without silently breaking
-old or new models against the wrong runtime:
+old or new models against the wrong runtime — regardless of which
+container (§2.1 GGUF or §2.2 `.nctr`) a given model is stored in; the two
+containers version independently of each other (§2.2's closing note):
 
 - **Non-breaking additions** (a new *optional* metadata key with a
   documented default) may ship without bumping the version.
