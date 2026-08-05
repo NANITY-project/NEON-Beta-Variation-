@@ -1,0 +1,2687 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>NANITY - Sovereign Intelligence</title>
+  <link rel="preconnect" href="https://fonts.googleapis.com" />
+  <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin />
+  <link href="https://fonts.googleapis.com/css2?family=Cormorant+Garamond:ital,wght@0,300;0,400;0,500;0,600;1,300;1,400&family=JetBrains+Mono:wght@300;400;500&display=swap" rel="stylesheet" />
+
+  <style>
+    /* - TOKENS - */
+    :root {
+      --black:   #000000;
+      --deep:    #080808;
+      --surface: #0d0d0d;
+      --border:  #700000;
+      --red:     #a60000;
+      --red-hi:  #c70000;
+      --red-dim: #6b0000;
+      --ivory:   #e8e2d9;
+      --ivory-dim: rgba(232,226,217,0.42);
+      --muted:   #ffffff;
+      --serif:   'Cormorant Garamond', Georgia, serif;
+      --mono:    'JetBrains Mono', 'Courier New', monospace;
+
+      /* - GLASS TOKENS - */
+      --glass-fill:      rgba(34, 13, 13, 0.5);
+      --glass-fill-hi:   rgba(50, 15, 15, 0.62);
+      --glass-border:    rgba(232, 226, 217, 0.14);
+      --glass-border-hi: rgba(198, 40, 40, 0.5);
+      --glass-sheen:     rgba(255, 255, 255, 0.09);
+      --glass-shadow:    0 20px 60px -20px rgba(0,0,0,0.75), 0 0 40px -18px rgba(166,0,0,0.28), inset 0 1px 0 var(--glass-sheen);
+      --glass-blur:      20px;
+      --radius-lg: 18px;
+      --radius-md: 12px;
+      --radius-sm: 8px;
+    }
+
+    /* - RESET - */
+    *, *::before, *::after { box-sizing: border-box; margin: 0; padding: 0; }
+
+    html {
+      scroll-behavior: smooth;
+      font-size: clamp(15px, 1.1vw, 18px);
+      background: var(--black);
+      cursor: crosshair;
+    }
+
+    body {
+      background: var(--black);
+      color: var(--ivory);
+      font-family: var(--serif);
+      overflow-x: hidden;
+      -webkit-font-smoothing: antialiased;
+    }
+
+    /* - GRAIN OVERLAY - */
+    body::before {
+      content: '';
+      position: fixed;
+      inset: 0;
+      pointer-events: none;
+      z-index: 999;
+      background-image: url("data:image/svg+xml,%3Csvg viewBox='0 0 256 256' xmlns='http://www.w3.org/2000/svg'%3E%3Cfilter id='noise'%3E%3CfeTurbulence type='fractalNoise' baseFrequency='0.9' numOctaves='4' stitchTiles='stitch'/%3E%3C/filter%3E%3Crect width='100%25' height='100%25' filter='url(%23noise)' opacity='0.04'/%3E%3C/svg%3E");
+      background-size: 200px 200px;
+      opacity: 0.35;
+    }
+
+    /* - AMBIENT GLOW (crimson edge light — backdrop for glass panels to
+       refract. Off on the hero; fades in once the hero has scrolled out,
+       so the first page stays pure black. Toggled via .active from JS. - */
+    #ambient-glow {
+      position: fixed;
+      inset: 0;
+      z-index: -1;
+      pointer-events: none;
+      overflow: hidden;
+      opacity: 0;
+      transition: opacity 1.1s ease;
+    }
+    #ambient-glow.active { opacity: 1; }
+
+    #ambient-glow span {
+      position: absolute;
+      top: -10vh;
+      height: 120vh;
+      width: 22vw;
+      min-width: 220px;
+      max-width: 420px;
+      filter: blur(70px);
+      will-change: opacity, transform, filter;
+    }
+    #ambient-glow .edge-left {
+      left: -12vw;
+      background: linear-gradient(to right, rgba(198,0,0,0.65), rgba(120,0,0,0.18) 55%, rgba(198,0,0,0) 85%);
+      animation: emberLeft 9s ease-in-out infinite;
+    }
+    #ambient-glow .edge-right {
+      right: -12vw;
+      background: linear-gradient(to left, rgba(198,0,0,0.65), rgba(120,0,0,0.18) 55%, rgba(198,0,0,0) 85%);
+      animation: emberRight 11s ease-in-out infinite;
+      animation-delay: -3s;
+    }
+    #ambient-glow .core-wash {
+      top: 0;
+      left: 10vw;
+      width: 80vw;
+      max-width: none;
+      height: 140vh;
+      background: radial-gradient(ellipse 60% 45% at 50% 30%, rgba(150,10,10,0.22), rgba(80,5,5,0.08) 55%, rgba(0,0,0,0) 80%);
+      filter: blur(50px);
+      opacity: 0.8;
+      animation: coreBreathe 14s ease-in-out infinite;
+    }
+
+    @keyframes coreBreathe {
+      0%, 100% { opacity: 0.55; transform: translateY(0) scale(1); }
+      50%      { opacity: 0.85; transform: translateY(2vh) scale(1.04); }
+    }
+
+    @keyframes emberLeft {
+      0%, 100% { opacity: 0.4; transform: translateY(0) scaleY(1); filter: blur(70px) brightness(1); }
+      50%      { opacity: 0.85; transform: translateY(-3vh) scaleY(1.04); filter: blur(85px) brightness(1.35); }
+    }
+    @keyframes emberRight {
+      0%, 100% { opacity: 0.35; transform: translateY(0) scaleY(1); filter: blur(65px) brightness(1); }
+      50%      { opacity: 0.75; transform: translateY(3vh) scaleY(1.05); filter: blur(80px) brightness(1.3); }
+    }
+
+    @media (prefers-reduced-motion: reduce) {
+      #ambient-glow span { animation: none !important; }
+    }
+
+    /* - GLASS PANEL UTILITY - */
+    .glass {
+      background: var(--glass-fill);
+      backdrop-filter: blur(var(--glass-blur)) saturate(140%);
+      -webkit-backdrop-filter: blur(var(--glass-blur)) saturate(140%);
+      border: 1px solid var(--glass-border);
+      box-shadow: var(--glass-shadow);
+    }
+
+    /* - SCROLLBAR - */
+    ::-webkit-scrollbar { width: 3px; }
+    ::-webkit-scrollbar-track { background: var(--black); }
+    ::-webkit-scrollbar-thumb { background: var(--red-dim); }
+
+    /* - SELECTION - */
+    ::selection { background: var(--red); color: var(--ivory); }
+
+    @media (prefers-reduced-motion: reduce) {
+      *, *::before, *::after {
+        animation-duration: 0.001ms !important;
+        animation-iteration-count: 1 !important;
+        transition-duration: 0.001ms !important;
+      }
+    }
+
+    /*- NAV - */
+    nav {
+      position: fixed;
+      top: 0; left: 0; right: 0;
+      z-index: 100;
+      display: flex;
+      align-items: center;
+      justify-content: space-between;
+      padding: 1.5rem 4rem;
+      mix-blend-mode: normal;
+      background: rgba(8, 5, 5, 0.42);
+      backdrop-filter: blur(16px) saturate(140%);
+      -webkit-backdrop-filter: blur(16px) saturate(140%);
+      border-bottom: 1px solid var(--glass-border);
+      box-shadow: 0 12px 40px -20px rgba(0,0,0,0.7);
+    }
+
+    .nav-logo {
+      font-family: var(--serif);
+      font-weight: 300;
+      font-size: 1.1rem;
+      letter-spacing: 0.55em;
+      text-transform: uppercase;
+      color: var(--ivory);
+      text-decoration: none;
+    }
+
+    .nav-logo span { color: var(--red); }
+
+    .nav-links {
+      display: flex;
+      gap: 3rem;
+      list-style: none;
+    }
+
+    .nav-links a {
+      font-family: var(--mono);
+      font-size: 0.6rem;
+      letter-spacing: 0.2em;
+      text-transform: uppercase;
+      color: var(--muted);
+      text-decoration: none;
+      transition: color 0.4s ease;
+    }
+
+    .nav-links a:hover { color: var(--ivory); }
+
+    /* - HERO - */
+    #hero {
+      position: relative;
+      height: 100vh;
+      min-height: 700px;
+      display: flex;
+      flex-direction: column;
+      align-items: center;
+      justify-content: center;
+      overflow: hidden;
+    }
+
+    /* Parallax background lines */
+    .hero-grid {
+      position: absolute;
+      inset: 0;
+      pointer-events: none;
+      background-image:
+        linear-gradient(to right, rgba(166, 0, 0, 0) 1px, transparent 1px),
+        linear-gradient(to bottom, rgba(166,0,0,0.04) 1px, transparent 1px);
+      background-size: 80px 80px;
+      transform: translateY(var(--parallax-y, 0px));
+      transition: transform 0.1s linear;
+    }
+
+    .hero-vignette {
+      position: absolute;
+      inset: 0;
+      pointer-events: none;
+      background: radial-gradient(ellipse at center, transparent 30%, var(--black) 100%);
+    }
+
+    .hero-content {
+      position: relative;
+      text-align: center;
+      max-width: 900px;
+      padding: 0 2rem;
+    }
+
+    .hero-tag {
+      font-family: var(--mono);
+      font-size: 0.6rem;
+      letter-spacing: 0.35em;
+      text-transform: uppercase;
+      color: var(--red);
+      margin-bottom: 2.5rem;
+      opacity: 0;
+      animation: fadeUp 1s ease 0.3s forwards;
+    }
+
+    .hero-title {
+      font-family: var(--serif);
+      font-weight: 300;
+      font-size: clamp(3.5rem, 9vw, 8rem);
+      line-height: 0.92;
+      letter-spacing: -0.01em;
+      color: var(--ivory);
+      margin-bottom: 2.5rem;
+      opacity: 0;
+      animation: fadeUp 1.2s ease 0.5s forwards;
+    }
+
+    .hero-title em {
+      font-style: italic;
+      color: var(--red);
+    }
+
+    .hero-sub {
+      font-family: var(--mono);
+      font-size: 0.68rem;
+      letter-spacing: 0.15em;
+      line-height: 2;
+      color: var(--muted);
+      max-width: 520px;
+      margin: 0 auto 3.5rem;
+      opacity: 0;
+      animation: fadeUp 1.2s ease 0.8s forwards;
+    }
+
+    .hero-cta {
+      display: inline-block;
+      padding: 0.85rem 2.8rem;
+      border: 1px solid var(--glass-border-hi);
+      border-radius: 999px;
+      background: rgba(166,0,0,0.08);
+      backdrop-filter: blur(10px);
+      -webkit-backdrop-filter: blur(10px);
+      font-family: var(--mono);
+      font-size: 0.6rem;
+      letter-spacing: 0.3em;
+      text-transform: uppercase;
+      color: var(--ivory);
+      text-decoration: none;
+      transition: background 0.4s ease, border-color 0.4s ease, transform 0.3s ease, box-shadow 0.4s ease;
+      opacity: 0;
+      animation: fadeUp 1.2s ease 1.1s forwards;
+    }
+
+    .hero-cta:hover {
+      background: var(--red);
+      border-color: var(--red);
+      transform: translateY(-2px);
+      box-shadow: 0 16px 40px -14px rgba(198,0,0,0.55);
+    }
+
+    .hero-scroll {
+      position: absolute;
+      bottom: 3rem;
+      left: 50%;
+      transform: translateX(-50%);
+      display: flex;
+      flex-direction: column;
+      align-items: center;
+      gap: 0.6rem;
+      opacity: 0;
+      animation: fadeIn 1s ease 2s forwards;
+    }
+
+    .hero-scroll span {
+      font-family: var(--mono);
+      font-size: 0.5rem;
+      letter-spacing: 0.3em;
+      color: var(--muted);
+    }
+
+    .scroll-line {
+      width: 1px;
+      height: 60px;
+      background: linear-gradient(to bottom, var(--red-dim), transparent);
+      animation: scrollPulse 2s ease infinite;
+    }
+
+    /* --- SECTION BASE -------------------------------------- */
+    section { padding: 10rem 4rem; }
+
+    .section-inner {
+      max-width: 1200px;
+      margin: 0 auto;
+    }
+
+    .section-tag {
+      font-family: var(--mono);
+      font-size: 0.55rem;
+      letter-spacing: 0.35em;
+      text-transform: uppercase;
+      color: var(--red);
+      margin-bottom: 4rem;
+      display: flex;
+      align-items: center;
+      gap: 1.5rem;
+    }
+
+    .section-tag::after {
+      content: '';
+      flex: 1;
+      max-width: 80px;
+      height: 1px;
+      background: var(--red-dim);
+    }
+
+    /* --- MANIFESTO ----------------------------------------- */
+    #manifesto {
+      border-top: 1px solid var(--border);
+    }
+
+    .manifesto-grid {
+      display: grid;
+      grid-template-columns: 1fr 1fr;
+      gap: 6rem;
+      align-items: start;
+    }
+
+    .manifesto-left h2 {
+      font-family: var(--serif);
+      font-weight: 300;
+      font-size: clamp(2.5rem, 4.5vw, 4.2rem);
+      line-height: 1.1;
+      color: var(--ivory);
+    }
+
+    .manifesto-left h2 em {
+      font-style: italic;
+      color: var(--red);
+    }
+
+    .manifesto-right {
+      padding-top: 0.5rem;
+    }
+
+    .manifesto-body {
+      font-family: var(--mono);
+      font-size: 0.68rem;
+      line-height: 2.2;
+      color: var(--muted);
+      margin-bottom: 2rem;
+    }
+
+    .manifesto-body strong {
+      color: var(--ivory);
+      font-weight: 400;
+    }
+
+    .manifesto-stat {
+      border-top: 1px solid var(--border);
+      padding-top: 2rem;
+      display: grid;
+      grid-template-columns: 1fr 1fr;
+      gap: 2rem;
+    }
+
+    .stat-item .num {
+      font-family: var(--serif);
+      font-weight: 300;
+      font-size: 2.8rem;
+      color: var(--red);
+      line-height: 1;
+      margin-bottom: 0.4rem;
+    }
+
+    .stat-item .label {
+      font-family: var(--mono);
+      font-size: 0.55rem;
+      letter-spacing: 0.2em;
+      color: var(--muted);
+      text-transform: uppercase;
+    }
+
+    /* --- PILLARS ------------------------------------------- */
+    #pillars {
+      background: rgba(13,13,13,0.55);
+      border-top: 1px solid var(--border);
+      border-bottom: 1px solid var(--border);
+      position: relative;
+    }
+
+    .pillars-header {
+      display: grid;
+      grid-template-columns: 1fr 2fr;
+      gap: 4rem;
+      margin-bottom: 6rem;
+    }
+
+    .pillars-title {
+      font-family: var(--serif);
+      font-weight: 300;
+      font-size: clamp(2rem, 3.5vw, 3.2rem);
+      line-height: 1.1;
+      color: var(--ivory);
+    }
+
+    .pillars-intro {
+      font-family: var(--mono);
+      font-size: 0.65rem;
+      line-height: 2;
+      color: var(--muted);
+      padding-top: 0.5rem;
+    }
+
+    .pillars-grid {
+      display: grid;
+      grid-template-columns: repeat(3, 1fr);
+      gap: 1.5rem;
+      border: none;
+    }
+
+    .pillar {
+      padding: 3rem 2.5rem;
+      border-right: none;
+      border: 1px solid var(--glass-border);
+      border-radius: var(--radius-lg);
+      background: var(--glass-fill);
+      backdrop-filter: blur(var(--glass-blur)) saturate(150%);
+      -webkit-backdrop-filter: blur(var(--glass-blur)) saturate(150%);
+      box-shadow: var(--glass-shadow);
+      position: relative;
+      overflow: hidden;
+      transition: background 0.5s ease, border-color 0.5s ease, transform 0.5s cubic-bezier(.16,1,.3,1), box-shadow 0.5s ease;
+    }
+
+    .pillar:last-child { border-right: none; }
+
+    /* top accent rule — dim by default, brightens on hover */
+    .pillar::before {
+      content: '';
+      position: absolute;
+      top: 0; left: 0; right: 0;
+      height: 1px;
+      background: linear-gradient(to right, transparent, var(--red-hi), transparent);
+      opacity: 0.4;
+      transform: scaleX(1);
+      transform-origin: left;
+      transition: opacity 0.5s ease;
+    }
+
+    /* specular sheen — a soft diagonal highlight like light catching glass */
+    .pillar::after {
+      content: '';
+      position: absolute;
+      inset: 0;
+      background: linear-gradient(135deg, rgba(255,255,255,0.07) 0%, rgba(255,255,255,0.02) 18%, rgba(255,255,255,0) 40%);
+      pointer-events: none;
+    }
+
+    .pillar:hover {
+      background: var(--glass-fill-hi);
+      border-color: var(--glass-border-hi);
+      transform: translateY(-4px);
+      box-shadow: 0 24px 60px -20px rgba(166,0,0,0.4), 0 0 50px -16px rgba(198,0,0,0.35), inset 0 1px 0 var(--glass-sheen);
+    }
+    .pillar:hover::before { opacity: 1; }
+
+    .pillar-index {
+      font-family: var(--mono);
+      font-size: 0.5rem;
+      letter-spacing: 0.2em;
+      color: var(--red-dim);
+      margin-bottom: 2.5rem;
+    }
+
+    .pillar-icon {
+      width: 32px;
+      height: 32px;
+      margin-bottom: 2rem;
+      opacity: 0.6;
+    }
+
+    .pillar h3 {
+      font-family: var(--serif);
+      font-weight: 400;
+      font-size: 1.5rem;
+      color: var(--ivory);
+      margin-bottom: 1.2rem;
+      line-height: 1.2;
+    }
+
+    .pillar p {
+      font-family: var(--mono);
+      font-size: 0.6rem;
+      line-height: 2;
+      color: var(--muted);
+    }
+
+    .pillar-status {
+      margin-top: 2.5rem;
+      font-family: var(--mono);
+      font-size: 0.5rem;
+      letter-spacing: 0.2em;
+      color: var(--red-dim);
+      text-transform: uppercase;
+      display: flex;
+      align-items: center;
+      gap: 0.6rem;
+    }
+
+    .status-dot {
+      width: 4px;
+      height: 4px;
+      border-radius: 50%;
+      background: var(--red-dim);
+      animation: pulse 2s ease infinite;
+    }
+
+    /* --- MODEL COMPATIBILITY -------------------------------- */
+    #compat {
+      border-top: 1px solid var(--border);
+      position: relative;
+    }
+
+    .compat-header {
+      display: grid;
+      grid-template-columns: 1fr 2fr;
+      gap: 4rem;
+      margin-bottom: 4.5rem;
+    }
+
+    .compat-title {
+      font-family: var(--serif);
+      font-weight: 300;
+      font-size: clamp(2rem, 3.5vw, 3.2rem);
+      line-height: 1.1;
+      color: var(--ivory);
+    }
+
+    .compat-title em { font-style: italic; color: var(--red); }
+
+    .compat-intro {
+      font-family: var(--mono);
+      font-size: 0.65rem;
+      line-height: 2;
+      color: var(--muted);
+      padding-top: 0.5rem;
+    }
+
+    .compat-intro code {
+      color: var(--red);
+      font-style: normal;
+    }
+
+    .compat-grid {
+      display: grid;
+      grid-template-columns: 1.1fr 0.9fr;
+      gap: 1.5rem;
+      align-items: stretch;
+    }
+
+    .compat-panel {
+      border-radius: var(--radius-lg);
+      background: var(--glass-fill);
+      backdrop-filter: blur(var(--glass-blur)) saturate(150%);
+      -webkit-backdrop-filter: blur(var(--glass-blur)) saturate(150%);
+      border: 1px solid var(--glass-border);
+      box-shadow: var(--glass-shadow);
+      padding: 2.4rem 2.4rem 2.6rem;
+      position: relative;
+      overflow: hidden;
+    }
+
+    .compat-panel::after {
+      content: '';
+      position: absolute;
+      inset: 0;
+      background: linear-gradient(135deg, rgba(255,255,255,0.06) 0%, rgba(255,255,255,0.02) 18%, rgba(255,255,255,0) 40%);
+      pointer-events: none;
+    }
+
+    .compat-panel h3 {
+      font-family: var(--serif);
+      font-weight: 400;
+      font-size: 1.35rem;
+      color: var(--ivory);
+      margin-bottom: 0.6rem;
+    }
+
+    .compat-panel .compat-sub {
+      font-family: var(--mono);
+      font-size: 0.55rem;
+      letter-spacing: 0.1em;
+      color: var(--red);
+      text-transform: uppercase;
+      margin-bottom: 1.8rem;
+      display: block;
+    }
+
+    .quant-grid {
+      display: flex;
+      flex-wrap: wrap;
+      gap: 0.6rem;
+      margin-bottom: 1.8rem;
+    }
+
+    .quant-chip {
+      font-family: var(--mono);
+      font-size: 0.58rem;
+      letter-spacing: 0.08em;
+      padding: 0.5rem 0.9rem;
+      border-radius: 999px;
+      background: rgba(232,226,217,0.05);
+      border: 1px solid var(--glass-border);
+      color: var(--ivory);
+      display: flex;
+      align-items: center;
+      gap: 0.5rem;
+      backdrop-filter: blur(6px);
+      transition: background 0.3s ease, border-color 0.3s ease, transform 0.3s ease;
+    }
+
+    .quant-chip:hover { transform: translateY(-2px); }
+
+    .quant-chip .qdot {
+      width: 5px; height: 5px; border-radius: 50%;
+      background: var(--red-dim); flex: none;
+    }
+
+    .quant-chip.live {
+      border-color: rgba(166,0,0,0.4);
+      background: rgba(166,0,0,0.08);
+    }
+    .quant-chip.live .qdot {
+      background: var(--red);
+      box-shadow: 0 0 6px var(--red);
+      animation: pulse 2.4s ease infinite;
+    }
+
+    .quant-chip.pending {
+      opacity: 0.55;
+    }
+    .quant-chip.pending .qdot { background: var(--ivory-dim); }
+
+    .quant-legend {
+      display: flex;
+      gap: 1.6rem;
+      flex-wrap: wrap;
+      font-family: var(--mono);
+      font-size: 0.5rem;
+      letter-spacing: 0.1em;
+      text-transform: uppercase;
+      color: var(--muted);
+      padding-top: 1.4rem;
+      border-top: 1px solid var(--glass-border);
+    }
+
+    .quant-legend span { display: flex; align-items: center; gap: 0.5rem; }
+    .quant-legend .qdot { width: 5px; height: 5px; border-radius: 50%; }
+    .quant-legend .qdot.live { background: var(--red); }
+    .quant-legend .qdot.pending { background: var(--ivory-dim); }
+
+    .spec-list {
+      display: flex;
+      flex-direction: column;
+      gap: 0;
+    }
+
+    .spec-row {
+      display: grid;
+      grid-template-columns: 1fr auto;
+      gap: 1rem;
+      padding: 0.95rem 0;
+      border-bottom: 1px solid var(--glass-border);
+      font-family: var(--mono);
+      font-size: 0.62rem;
+      color: var(--ivory);
+      align-items: baseline;
+    }
+    .spec-row:last-child { border-bottom: none; }
+    .spec-row .sk { color: var(--muted); }
+    .spec-row .sv { color: var(--red); text-align: right; white-space: nowrap; }
+
+    .compat-note {
+      margin-top: 1.8rem;
+      padding: 1rem 1.2rem;
+      border-radius: var(--radius-sm);
+      background: rgba(166,0,0,0.06);
+      border: 1px solid rgba(166,0,0,0.25);
+      font-family: var(--mono);
+      font-size: 0.56rem;
+      line-height: 1.9;
+      color: var(--muted);
+    }
+    .compat-note code { color: var(--red); }
+
+    @media (max-width: 900px) {
+      .compat-header, .compat-grid { grid-template-columns: 1fr; }
+    }
+
+    /* --- UPCOMING ------------------------------------------ */
+    #upcoming {
+      border-top: 1px solid var(--border);
+    }
+
+    .upcoming-header {
+      text-align: center;
+      margin-bottom: 7rem;
+    }
+
+    .upcoming-title {
+      font-family: var(--serif);
+      font-weight: 300;
+      font-size: clamp(2.5rem, 5vw, 4.5rem);
+      line-height: 1.05;
+      color: var(--ivory);
+    }
+
+    .upcoming-title em {
+      font-style: italic;
+      color: var(--red);
+    }
+
+    .upcoming-sub {
+      font-family: var(--mono);
+      font-size: 0.62rem;
+      letter-spacing: 0.12em;
+      color: var(--muted);
+      margin-top: 1.5rem;
+    }
+
+    .releases-list {
+      display: flex;
+      flex-direction: column;
+      gap: 0;
+    }
+
+    .release-item {
+      display: grid;
+      grid-template-columns: 120px 1fr 200px;
+      align-items: center;
+      gap: 4rem;
+      padding: 2rem 1.6rem;
+      margin-bottom: 0.9rem;
+      border: 1px solid var(--glass-border);
+      border-radius: var(--radius-md);
+      background: rgba(232,226,217,0.02);
+      backdrop-filter: blur(10px);
+      -webkit-backdrop-filter: blur(10px);
+      transition: all 0.4s ease;
+      cursor: default;
+    }
+
+    .release-item:first-child { border-top: 1px solid var(--glass-border); }
+    .release-item:last-child { margin-bottom: 0; }
+
+    .release-item:hover .release-name { color: var(--red); }
+    .release-item:hover {
+      background: var(--glass-fill);
+      border-color: var(--glass-border-hi);
+      padding-left: 2rem;
+      box-shadow: var(--glass-shadow);
+    }
+
+    .release-date {
+      font-family: var(--mono);
+      font-size: 0.55rem;
+      letter-spacing: 0.2em;
+      color: var(--muted);
+      text-transform: uppercase;
+    }
+
+    .release-name {
+      font-family: var(--serif);
+      font-weight: 300;
+      font-size: 1.7rem;
+      color: var(--ivory);
+      transition: color 0.4s ease;
+    }
+
+    .release-desc {
+      font-family: var(--mono);
+      font-size: 0.58rem;
+      color: var(--muted);
+      line-height: 1.8;
+    }
+
+    .release-badge {
+      font-family: var(--mono);
+      font-size: 0.5rem;
+      letter-spacing: 0.2em;
+      text-transform: uppercase;
+      padding: 0.35rem 1rem;
+      border: 1px solid var(--border);
+      color: var(--muted);
+      text-align: center;
+    }
+
+    .release-badge.soon {
+      border-color: var(--red-dim);
+      color: var(--red);
+    }
+
+    /* --- DIVIDER ------------------------------------------- */
+    .divider-full {
+      width: 100%;
+      height: 1px;
+      background: linear-gradient(to right, transparent, var(--red-dim) 30%, var(--red-dim) 70%, transparent);
+      margin: 0;
+    }
+
+    /* --- PHILOSOPHY ---------------------------------------- */
+    #philosophy {
+      background: rgba(13,13,13,0.55);
+      border-top: 1px solid var(--border);
+      border-bottom: 1px solid var(--border);
+      position: relative;
+    }
+
+    .philosophy-layout {
+      display: grid;
+      grid-template-columns: 1fr 1fr;
+      gap: 8rem;
+      align-items: center;
+    }
+
+    .philosophy-quote {
+      font-family: var(--serif);
+      font-weight: 300;
+      font-size: clamp(2rem, 3.2vw, 3rem);
+      line-height: 1.35;
+      color: var(--ivory);
+      letter-spacing: 0.01em;
+    }
+
+    .philosophy-quote em {
+      font-style: italic;
+      color: var(--red);
+    }
+
+    .philosophy-right {
+      border: 1px solid var(--glass-border);
+      border-radius: var(--radius-lg);
+      background: var(--glass-fill);
+      backdrop-filter: blur(var(--glass-blur)) saturate(140%);
+      -webkit-backdrop-filter: blur(var(--glass-blur)) saturate(140%);
+      box-shadow: var(--glass-shadow);
+      padding: 3rem;
+    }
+
+    .philosophy-lines {
+      display: flex;
+      flex-direction: column;
+      gap: 2.5rem;
+    }
+
+    .philosophy-line {
+      display: flex;
+      gap: 1.5rem;
+    }
+
+    .phi-num {
+      font-family: var(--mono);
+      font-size: 0.5rem;
+      color: var(--red-dim);
+      padding-top: 0.2rem;
+      min-width: 24px;
+    }
+
+    .phi-text {
+      font-family: var(--mono);
+      font-size: 0.62rem;
+      line-height: 2;
+      color: var(--muted);
+    }
+
+    .phi-text strong {
+      color: var(--ivory);
+      font-weight: 400;
+    }
+
+    /* --- CONTACT ------------------------------------------- */
+    #contact {
+      border-top: 1px solid var(--border);
+    }
+
+    .contact-inner {
+      max-width: 700px;
+      margin: 0 auto;
+      text-align: center;
+    }
+
+    .contact-title {
+      font-family: var(--serif);
+      font-weight: 300;
+      font-size: clamp(2.5rem, 5vw, 4.5rem);
+      line-height: 1.05;
+      color: var(--ivory);
+      margin-bottom: 1.5rem;
+    }
+
+    .contact-title em {
+      font-style: italic;
+      color: var(--red);
+    }
+
+    .contact-sub {
+      font-family: var(--mono);
+      font-size: 0.62rem;
+      letter-spacing: 0.1em;
+      color: var(--muted);
+      line-height: 2;
+      margin-bottom: 4rem;
+    }
+
+    .contact-form {
+      display: flex;
+      flex-direction: column;
+      gap: 0;
+      border: 1px solid var(--glass-border);
+      border-radius: var(--radius-lg);
+      background: var(--glass-fill);
+      backdrop-filter: blur(var(--glass-blur)) saturate(140%);
+      -webkit-backdrop-filter: blur(var(--glass-blur)) saturate(140%);
+      box-shadow: var(--glass-shadow);
+      overflow: hidden;
+    }
+
+    .form-row {
+      display: grid;
+      grid-template-columns: 1fr 1fr;
+      border-bottom: 1px solid var(--glass-border);
+    }
+
+    .form-row:last-of-type { border-bottom: none; }
+
+    .form-field {
+      position: relative;
+      border-right: 1px solid var(--glass-border);
+      transition: background 0.3s ease;
+    }
+
+    .form-field:focus-within { background: rgba(166,0,0,0.04); }
+
+    .form-field:last-child { border-right: none; }
+
+    .form-label {
+      position: absolute;
+      top: 1rem;
+      left: 1.5rem;
+      font-family: var(--mono);
+      font-size: 0.5rem;
+      letter-spacing: 0.2em;
+      text-transform: uppercase;
+      color: var(--muted);
+      pointer-events: none;
+      transition: color 0.3s ease;
+    }
+
+    .form-field:focus-within .form-label { color: var(--red); }
+
+    .form-field input,
+    .form-field textarea,
+    .form-field select {
+      width: 100%;
+      background: transparent;
+      border: none;
+      outline: none;
+      padding: 2.5rem 1.5rem 1rem;
+      font-family: var(--mono);
+      font-size: 0.65rem;
+      color: var(--ivory);
+      letter-spacing: 0.05em;
+      resize: none;
+    }
+
+    .form-field textarea { min-height: 140px; }
+
+    .form-field input::placeholder,
+    .form-field textarea::placeholder { color: var(--border); }
+
+    .form-full {
+      grid-column: 1 / -1;
+      border-right: none;
+      border-bottom: 1px solid var(--glass-border);
+    }
+
+    .form-submit {
+      display: flex;
+      align-items: center;
+      justify-content: space-between;
+      padding: 1.5rem;
+      border-top: 1px solid var(--glass-border);
+      background: rgba(232,226,217,0.02);
+    }
+
+    .form-note {
+      font-family: var(--mono);
+      font-size: 0.5rem;
+      color: var(--muted);
+      letter-spacing: 0.15em;
+    }
+
+    .btn-submit {
+      background: linear-gradient(180deg, var(--red-hi), var(--red));
+      border: 1px solid rgba(255,255,255,0.1);
+      border-radius: var(--radius-sm);
+      padding: 0.9rem 2.5rem;
+      font-family: var(--mono);
+      font-size: 0.58rem;
+      letter-spacing: 0.3em;
+      text-transform: uppercase;
+      color: var(--ivory);
+      cursor: pointer;
+      transition: background 0.4s ease, transform 0.3s ease, box-shadow 0.3s ease;
+    }
+
+    .btn-submit:hover {
+      background: linear-gradient(180deg, #d40000, var(--red-hi));
+      transform: translateY(-2px);
+      box-shadow: 0 12px 28px -10px rgba(198,0,0,0.6);
+    }
+
+    .form-success {
+      display: none;
+      padding: 4rem;
+      text-align: center;
+    }
+
+    .form-success-title {
+      font-family: var(--serif);
+      font-size: 2rem;
+      font-weight: 300;
+      color: var(--ivory);
+      margin-bottom: 1rem;
+    }
+
+    .form-success-msg {
+      font-family: var(--mono);
+      font-size: 0.6rem;
+      color: var(--muted);
+      line-height: 2;
+    }
+
+    /* --- FOOTER -------------------------------------------- */
+    footer {
+      border-top: 1px solid var(--glass-border);
+      background: rgba(8,5,5,0.35);
+      backdrop-filter: blur(14px) saturate(140%);
+      -webkit-backdrop-filter: blur(14px) saturate(140%);
+      padding: 3rem 4rem;
+      display: flex;
+      align-items: center;
+      justify-content: space-between;
+      position: relative;
+    }
+
+    .footer-logo {
+      font-family: var(--serif);
+      font-weight: 300;
+      font-size: 0.9rem;
+      letter-spacing: 0.55em;
+      text-transform: uppercase;
+      color: var(--muted);
+    }
+
+    .footer-logo span { color: var(--red-dim); }
+
+    .footer-copy {
+      font-family: var(--mono);
+      font-size: 0.5rem;
+      letter-spacing: 0.15em;
+      color: var(--muted);
+    }
+
+    .footer-links {
+      display: flex;
+      gap: 2rem;
+    }
+
+    .footer-links a {
+      font-family: var(--mono);
+      font-size: 0.5rem;
+      letter-spacing: 0.15em;
+      color: var(--muted);
+      text-decoration: none;
+      transition: color 0.3s ease;
+    }
+
+    .footer-links a:hover { color: var(--red); }
+
+    /* --- KEYFRAMES ----------------------------------------- */
+    @keyframes fadeUp {
+      from { opacity: 0; transform: translateY(24px); }
+      to   { opacity: 1; transform: translateY(0); }
+    }
+
+    @keyframes fadeIn {
+      from { opacity: 0; }
+      to   { opacity: 1; }
+    }
+
+    @keyframes scrollPulse {
+      0%, 100% { opacity: 1; }
+      50%       { opacity: 0.3; }
+    }
+
+    @keyframes pulse {
+      0%, 100% { opacity: 1; }
+      50%       { opacity: 0.3; }
+    }
+
+    /* --- REVEAL ON SCROLL ---------------------------------- */
+    .reveal {
+      opacity: 0;
+      transform: translateY(30px);
+      transition: opacity 0.9s cubic-bezier(0.16,1,0.3,1), transform 0.9s cubic-bezier(0.16,1,0.3,1);
+    }
+
+    .reveal.visible {
+      opacity: 1;
+      transform: translateY(0);
+    }
+
+    .reveal-delay-1 { transition-delay: 0.1s; }
+    .reveal-delay-2 { transition-delay: 0.2s; }
+    .reveal-delay-3 { transition-delay: 0.35s; }
+    .reveal-delay-4 { transition-delay: 0.5s; }
+
+    /* --- RESPONSIVE ---------------------------------------- */
+    @media (max-width: 900px) {
+      nav { padding: 1.5rem 2rem; }
+      .nav-links { display: none; }
+      section { padding: 6rem 2rem; }
+      .manifesto-grid,
+      .pillars-header,
+      .philosophy-layout { grid-template-columns: 1fr; gap: 3rem; }
+      .pillars-grid { grid-template-columns: 1fr; }
+      .pillar { border-right: none; border-bottom: 1px solid var(--border); }
+      .pillar:last-child { border-bottom: none; }
+      .philosophy-right { border-left: none; padding-left: 0; border-top: 1px solid var(--border); padding-top: 3rem; }
+      .form-row { grid-template-columns: 1fr; }
+      .form-field { border-right: none; border-bottom: 1px solid var(--border); }
+      footer { flex-direction: column; gap: 1.5rem; text-align: center; }
+      .release-item { grid-template-columns: 1fr; gap: 0.8rem; padding: 2rem 0; }
+      .release-badge { text-align: left; }
+    }
+
+    /* --- NEON LAUNCH BUTTON -------------------------------- */
+    .pillar-launch {
+      display: inline-block;
+      margin-top: 1.6rem;
+      background: rgba(166,0,0,0.08);
+      border: 1px solid var(--glass-border-hi);
+      border-radius: 999px;
+      padding: 0.65rem 1.5rem;
+      font-family: var(--mono);
+      font-size: 0.55rem;
+      letter-spacing: 0.25em;
+      text-transform: uppercase;
+      color: var(--ivory);
+      cursor: pointer;
+      backdrop-filter: blur(8px);
+      transition: background 0.4s ease, border-color 0.4s ease, transform 0.3s ease;
+    }
+
+    .pillar-launch:hover {
+      background: var(--red);
+      border-color: var(--red);
+      transform: translateY(-2px);
+    }
+
+    /* --- NEON RUNTIME MODAL -------------------------------- */
+    .neon-modal-backdrop {
+      position: fixed;
+      inset: 0;
+      z-index: 500;
+      display: none;
+      align-items: center;
+      justify-content: center;
+      padding: 4vh 4vw;
+      background: rgba(0,0,0,0.88);
+      backdrop-filter: blur(6px);
+      opacity: 0;
+      transition: opacity 0.4s ease;
+      cursor: default;
+    }
+
+    .neon-modal-backdrop.open {
+      display: flex;
+      opacity: 1;
+    }
+
+    .neon-modal-panel {
+      width: min(1040px, 96vw);
+      height: min(760px, 90vh);
+      background: var(--glass-fill-hi);
+      backdrop-filter: blur(24px) saturate(150%);
+      -webkit-backdrop-filter: blur(24px) saturate(150%);
+      border: 1px solid var(--glass-border-hi);
+      border-radius: var(--radius-lg);
+      display: flex;
+      flex-direction: column;
+      position: relative;
+      opacity: 0;
+      overflow: hidden;
+      transform: translateY(24px);
+      animation: fadeUp 0.5s cubic-bezier(0.16,1,0.3,1) 0.05s forwards;
+      box-shadow: 0 30px 90px -20px rgba(166,0,0,0.25), 0 0 0 1px rgba(0,0,0,0.4), inset 0 1px 0 var(--glass-sheen);
+    }
+
+    .neon-modal-bar {
+      display: flex;
+      align-items: center;
+      justify-content: space-between;
+      padding: 1.1rem 1.6rem;
+      background: rgba(0,0,0,0.2);
+      border-bottom: 1px solid var(--glass-border);
+      flex-shrink: 0;
+    }
+
+    .neon-modal-tag {
+      font-family: var(--mono);
+      font-size: 0.55rem;
+      letter-spacing: 0.3em;
+      text-transform: uppercase;
+      color: var(--red);
+    }
+
+    .neon-modal-close {
+      background: none;
+      border: none;
+      color: var(--muted);
+      font-size: 1.4rem;
+      line-height: 1;
+      cursor: pointer;
+      transition: color 0.3s ease;
+    }
+
+    .neon-modal-close:hover { color: var(--red); }
+
+    .neon-modal-body {
+      flex: 1;
+      position: relative;
+      overflow: hidden;
+      display: flex;
+      flex-direction: column;
+    }
+
+    .neon-modal-loading,
+    .neon-modal-offline {
+      position: absolute;
+      inset: 0;
+      display: flex;
+      flex-direction: column;
+      align-items: center;
+      justify-content: center;
+      gap: 1.2rem;
+      text-align: center;
+      padding: 2rem;
+    }
+
+    .neon-modal-pulse {
+      width: 10px;
+      height: 10px;
+      border-radius: 50%;
+      background: var(--red);
+      animation: pulse 1.4s ease infinite;
+    }
+
+    .neon-modal-loading p {
+      font-family: var(--mono);
+      font-size: 0.62rem;
+      letter-spacing: 0.1em;
+      color: var(--muted);
+    }
+
+    .neon-modal-offline-title {
+      font-family: var(--serif);
+      font-size: 1.4rem;
+      font-weight: 300;
+      color: var(--ivory);
+    }
+
+    .neon-modal-offline-msg {
+      font-family: var(--mono);
+      font-size: 0.62rem;
+      line-height: 1.9;
+      color: var(--muted);
+      max-width: 380px;
+    }
+
+    .neon-modal-offline-msg code {
+      color: var(--red);
+      font-family: var(--mono);
+    }
+
+    @media (max-width: 700px) {
+      .neon-modal-panel { height: 92vh; }
+      .neon-modal-backdrop { padding: 0; }
+    }
+
+    /* ════════════════════════════════════════════════════════════════
+       NEON RUNTIME CONSOLE — merged from neon_console.html
+       Scoped under #neonApp so it doesn't bleed into the marketing
+       page's own type rhythm, cursor theme, or keyframes.
+       ════════════════════════════════════════════════════════════════ */
+    #neonApp {
+      position: relative;
+      z-index: 1;
+      height: 100%;
+      width: 100%;
+      display: flex;
+      flex-direction: column;
+      background: transparent;
+      color: var(--ivory);
+      font-family: var(--mono);
+    }
+    #neonApp button, #neonApp a { cursor: pointer; }
+    #neonApp input, #neonApp textarea { cursor: text; }
+    #neonApp button:focus-visible,
+    #neonApp input:focus-visible,
+    #neonApp textarea:focus-visible,
+    #neonApp [tabindex]:focus-visible {
+      outline: 1px solid var(--red);
+      outline-offset: 2px;
+    }
+
+    @keyframes fadeUpSm { from { opacity: 0; transform: translateY(14px); } to { opacity: 1; transform: translateY(0); } }
+    @keyframes spinFade { 0%, 100% { opacity: 1; } 50% { opacity: 0.2; } }
+
+    #topbar { flex: 0 0 auto; height: 54px; display: flex; align-items: center; justify-content: space-between;
+      padding: 0 1.4rem; border-bottom: 1px solid var(--glass-border); background: rgba(0,0,0,0.22); backdrop-filter: blur(12px); position: relative; z-index: 10; }
+    .brand { display: flex; align-items: center; gap: 1rem; }
+    .wordmark { font-family: var(--serif); font-weight: 300; font-size: 1.25rem; letter-spacing: .16em; text-transform: uppercase; color: var(--ivory); }
+    .wordmark .accent { color: var(--red); font-style: italic; }
+    .brand-sub { display: flex; align-items: center; gap: .5rem; font-size: .52rem; letter-spacing: .28em; text-transform: uppercase; color: var(--red); }
+    .brand-sub .dot { width: 5px; height: 5px; border-radius: 50%; background: var(--red-dim); animation: pulse 2s ease infinite; }
+
+    .engine-badge { display: flex; align-items: center; gap: .55rem; padding: .4rem .85rem; border: 1px solid var(--glass-border);
+      border-radius: 999px; background: rgba(232,226,217,0.04); backdrop-filter: blur(6px);
+      font-size: .52rem; letter-spacing: .15em; text-transform: uppercase; color: var(--muted); }
+    .engine-badge .dot { width: 6px; height: 6px; border-radius: 50%; background: var(--red-dim); }
+    .engine-badge.ready { border-color: var(--red-dim); color: var(--ivory); }
+    .engine-badge.ready .dot { background: var(--red); box-shadow: 0 0 6px var(--red); animation: pulse 2.2s ease infinite; }
+
+    #content { flex: 1 1 auto; min-height: 0; position: relative; overflow: hidden; }
+    #neonApp .screen { position: absolute; inset: 0; overflow-y: auto; padding: 2.4rem 2rem 3rem;
+      opacity: 0; visibility: hidden; transform: translateY(10px); pointer-events: none;
+      transition: opacity .4s cubic-bezier(.16,1,.3,1), transform .4s cubic-bezier(.16,1,.3,1); }
+    #neonApp .screen.active { opacity: 1; visibility: visible; transform: translateY(0); pointer-events: auto; }
+
+    #neonApp .shell { max-width: 760px; margin: 0 auto; display: flex; flex-direction: column; min-height: 100%; }
+
+    .boot-intro { font-size: .64rem; line-height: 1.9; color: var(--muted); margin-bottom: 2rem; max-width: 560px; }
+    .boot-intro code { color: var(--red); font-style: normal; }
+
+    #neonApp .tag { display: flex; align-items: center; gap: 1rem; margin: 2.2rem 0 1.1rem; }
+    #neonApp .tag:first-of-type { margin-top: 0; }
+    .tag-text { font-size: .55rem; letter-spacing: .3em; text-transform: uppercase; color: var(--red); white-space: nowrap; }
+    .tag-rule { flex: 1; height: 1px; background: var(--red-dim); }
+    .tag-collapsible { cursor: pointer; user-select: none; }
+    .chev { flex: none; color: var(--muted); font-size: .6rem; transition: transform .3s ease; }
+    .tag-collapsible.open .chev { transform: rotate(90deg); }
+
+    /* --- PICKER TABS / LIBRARY --------------------------------------- */
+    .picker-tabs { display: flex; border: 1px solid var(--glass-border); border-radius: var(--radius-sm);
+      background: rgba(0,0,0,0.18); backdrop-filter: blur(8px); margin-bottom: 1.2rem; overflow: hidden; }
+    .tab-btn { flex: 1; background: transparent; border: none; border-right: 1px solid var(--glass-border);
+      padding: .7rem 1rem; font-family: var(--mono); font-size: .58rem; letter-spacing: .2em; text-transform: uppercase;
+      color: var(--muted); transition: background .25s, color .25s; }
+    .tab-btn:last-child { border-right: none; }
+    .tab-btn:hover { color: var(--ivory); }
+    .tab-btn.active { background: rgba(166,0,0,.16); color: var(--ivory); }
+    .tab-panel[hidden] { display: none; }
+
+    .dropzone { border: 1px dashed var(--glass-border-hi); border-radius: var(--radius-md);
+      background: rgba(232,226,217,0.02); backdrop-filter: blur(8px);
+      padding: 2rem 1.4rem; text-align: center; margin-bottom: 1.3rem;
+      transition: border-color .3s, background .3s; }
+    .dropzone.drag { border-color: var(--red); background: rgba(166,0,0,.1); }
+    .dz-icon { font-size: 1.5rem; color: var(--red-dim); margin-bottom: .5rem; line-height: 1; }
+    .dz-text { font-size: .6rem; letter-spacing: .08em; text-transform: uppercase; color: var(--muted); margin-bottom: 1rem; }
+    .dz-hint { margin-top: .9rem; font-size: .5rem; letter-spacing: .05em; color: var(--ivory-dim); }
+
+    .btn-ghost { background: rgba(232,226,217,0.03); border: 1px solid var(--glass-border-hi); border-radius: var(--radius-sm);
+      padding: .6rem 1.4rem; backdrop-filter: blur(6px);
+      font-family: var(--mono); font-size: .55rem; letter-spacing: .22em; text-transform: uppercase; color: var(--ivory);
+      transition: background .3s, border-color .3s, transform .25s; }
+    .btn-ghost:hover { background: var(--red); border-color: var(--red); transform: translateY(-1px); }
+    .btn-ghost:disabled { opacity: .5; cursor: default; }
+    .btn-sm { padding: .4rem .9rem; font-size: .5rem; }
+
+    .upload-progress-wrap { margin-top: 1.1rem; }
+    .upload-progress-bar { height: 3px; background: var(--glass-border); border-radius: 3px; overflow: hidden; position: relative; }
+    .upload-progress-fill { position: absolute; inset: 0; width: 0%; background: var(--red); transition: width .15s linear; }
+    .upload-progress-label { margin-top: .5rem; font-size: .52rem; letter-spacing: .08em; color: var(--muted); }
+
+    .library-list { border: 1px solid var(--glass-border); border-radius: var(--radius-md);
+      background: rgba(0,0,0,0.15); backdrop-filter: blur(8px); max-height: 230px; overflow-y: auto; }
+    .library-empty { padding: 1.5rem 1.2rem; font-size: .6rem; line-height: 1.9; color: var(--muted); text-align: center; }
+    .library-row { display: grid; grid-template-columns: 1.3fr .6fr 1.7fr; gap: 1rem; align-items: center;
+      padding: .7rem 1rem; border-bottom: 1px solid var(--glass-border); transition: background .25s; }
+    .library-row:last-child { border-bottom: none; }
+    .library-row:hover { background: rgba(166,0,0,.06); }
+    .library-row.selected { background: rgba(166,0,0,.14); box-shadow: inset 2px 0 0 var(--red); }
+    .lr-name { font-size: .64rem; color: var(--ivory); overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+    .lr-size { font-size: .54rem; color: var(--red-dim); text-align: right; white-space: nowrap; }
+    .lr-path { font-size: .5rem; color: var(--ivory-dim); overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+
+    .field-label { display: block; font-size: .54rem; letter-spacing: .2em; text-transform: uppercase; color: var(--muted); margin-bottom: .6rem; }
+    .text-input { width: 100%; background: rgba(0,0,0,0.15); border: 1px solid var(--glass-border); border-radius: var(--radius-sm);
+      padding: .85rem 1rem; backdrop-filter: blur(6px);
+      font-family: var(--mono); font-size: .64rem; color: var(--ivory); outline: none; transition: border-color .3s; }
+    .text-input:focus { border-color: var(--red); }
+    .text-input::placeholder { color: rgba(232,226,217,.25); }
+
+    .selected-model { margin-top: 1.2rem; border: 1px solid var(--glass-border-hi); border-radius: var(--radius-sm);
+      background: rgba(166,0,0,.05); backdrop-filter: blur(6px); padding: .8rem 1.1rem;
+      display: flex; align-items: baseline; gap: .9rem; font-size: .6rem; }
+    .sm-label { color: var(--red); letter-spacing: .2em; font-size: .52rem; }
+    .sm-name { flex: 1; color: var(--ivory); overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+    .sm-size { color: var(--muted); font-size: .55rem; }
+
+    /* --- BUILD FLAGS -------------------------------------------------- */
+    .build-flags { border: 1px solid var(--glass-border); border-radius: var(--radius-md);
+      background: rgba(0,0,0,0.12); backdrop-filter: blur(8px); padding: .4rem 1.2rem 1rem; margin-bottom: 1.3rem; }
+    .flag-row { display: grid; grid-template-columns: auto 1fr; gap: .15rem .9rem; padding: .65rem 0;
+      border-bottom: 1px solid rgba(112,0,0,.3); align-items: start; cursor: pointer; }
+    .flag-row:last-of-type { border-bottom: none; }
+    .flag-row input { accent-color: var(--red); margin-top: .25rem; }
+    .flag-label { font-size: .6rem; color: var(--ivory); grid-column: 2; grid-row: 1; }
+    .flag-desc { font-size: .53rem; color: var(--muted); grid-column: 2; grid-row: 2; line-height: 1.7; }
+    .compiler-readout { margin-top: .4rem; padding-top: .8rem; border-top: 1px solid var(--glass-border);
+      font-size: .54rem; letter-spacing: .08em; color: var(--muted); }
+    .compiler-readout b { color: var(--red); font-weight: 400; }
+
+    .btn-primary { background: linear-gradient(180deg, var(--red-hi), var(--red)); border: 1px solid rgba(255,255,255,0.08);
+      border-radius: var(--radius-sm); padding: 1rem; font-family: var(--mono);
+      font-size: .62rem; letter-spacing: .26em; text-transform: uppercase; color: var(--ivory);
+      transition: background .3s, transform .25s, box-shadow .3s; }
+    .btn-primary:hover { background: linear-gradient(180deg, #d40000, var(--red-hi)); transform: translateY(-1px);
+      box-shadow: 0 12px 28px -12px rgba(198,0,0,0.6); }
+    .btn-primary:disabled { opacity: .5; cursor: default; }
+    .btn-block { width: 100%; }
+
+    /* --- STAGES / ERRORS ---------------------------------------------- */
+    .stage-list { margin-top: 1.4rem; border: 1px solid var(--glass-border); border-radius: var(--radius-md);
+      background: rgba(0,0,0,0.12); backdrop-filter: blur(8px); overflow: hidden; }
+    .stage-row { padding: .7rem 1rem; border-bottom: 1px solid var(--glass-border); display: flex; flex-wrap: wrap;
+      align-items: center; gap: .8rem; font-size: .62rem; }
+    .stage-row:last-child { border-bottom: none; }
+    .stage-icon { width: 1rem; text-align: center; color: var(--red-dim); }
+    .stage-row.ok .stage-icon { color: var(--ivory); }
+    .stage-row.fail .stage-icon { color: var(--red); }
+    .stage-row.pending .stage-icon { animation: spinFade 1s ease infinite; }
+    .stage-name { flex: 1; color: var(--ivory); }
+    .stage-ms { color: var(--muted); font-size: .52rem; }
+    .stage-row.expandable { cursor: pointer; }
+    .stage-detail { display: none; width: 100%; margin-top: .6rem; padding: .7rem .9rem; background: rgba(0,0,0,.4);
+      border: 1px solid var(--glass-border); border-radius: var(--radius-sm); font-size: .56rem; line-height: 1.7; white-space: pre-wrap; color: var(--muted);
+      max-height: 170px; overflow-y: auto; }
+    .stage-row.expanded .stage-detail { display: block; }
+
+    .inline-error { margin-top: 1rem; padding: .9rem 1.1rem; border: 1px solid var(--red-dim); border-radius: var(--radius-sm);
+      background: rgba(166,0,0,.1); backdrop-filter: blur(6px); color: var(--red); font-size: .6rem; line-height: 1.8; }
+
+    /* --- CONSOLE SCREEN ----------------------------------------------- */
+    .console-meta { display: flex; align-items: center; gap: 1.6rem; flex-wrap: wrap; padding-bottom: 1.1rem;
+      border-bottom: 1px solid var(--glass-border); margin-bottom: 1.3rem; }
+    .meta-item { display: flex; flex-direction: column; gap: .25rem; }
+    .meta-k { font-size: .48rem; letter-spacing: .2em; color: var(--red); text-transform: uppercase; }
+    .meta-v { font-size: .6rem; color: var(--ivory); }
+    .console-meta .btn-ghost { margin-left: auto; }
+
+    .transcript { flex: 1 1 auto; }
+    .transcript-empty { padding: 2.6rem 1rem; text-align: center; color: var(--muted); font-size: .6rem; line-height: 1.9; }
+    #neonApp .msg { margin-bottom: 1.3rem; animation: fadeUpSm .35s cubic-bezier(.16,1,.3,1) both; }
+    .msg-user .msg-bubble { font-size: .66rem; color: var(--ivory); line-height: 1.8; }
+    .msg-user .msg-bubble .arrow { color: var(--red); }
+    .msg-result { border: 1px solid var(--glass-border); border-radius: var(--radius-md);
+      background: rgba(0,0,0,0.15); backdrop-filter: blur(8px); margin-top: .5rem; overflow: hidden; }
+    .msg-result.fail { border-color: var(--red-dim); }
+    .msg-result-body { padding: .85rem 1.05rem; font-size: .6rem; line-height: 1.85; white-space: pre-wrap; color: var(--muted); max-height: 280px; overflow-y: auto; }
+    .msg-result.fail .msg-result-body { color: var(--red); }
+    .msg-result-meta { display: flex; gap: 1.1rem; padding: .45rem 1.05rem; border-top: 1px solid var(--glass-border);
+      font-size: .48rem; letter-spacing: .08em; color: var(--ivory-dim); }
+    .msg-pending .msg-result-body { display: flex; align-items: center; gap: .6rem; color: var(--muted); }
+    .pulse-dot { width: 5px; height: 5px; border-radius: 50%; background: var(--red-dim); animation: pulse 1s ease infinite; }
+
+    .composer { position: sticky; bottom: 0; background: rgba(8,5,5,0.55); backdrop-filter: blur(16px);
+      border-top: 1px solid var(--glass-border); padding-top: 1.1rem; margin-top: 1.4rem; }
+    .composer textarea { width: 100%; background: rgba(0,0,0,0.15); border: 1px solid var(--glass-border); border-radius: var(--radius-sm);
+      padding: .8rem 1rem; backdrop-filter: blur(6px);
+      font-family: var(--mono); color: var(--ivory); font-size: .64rem; resize: vertical; outline: none; transition: border-color .3s; }
+    .composer textarea:focus { border-color: var(--red); }
+    .composer-row { display: flex; align-items: center; justify-content: space-between; gap: 1rem; margin-top: .8rem; flex-wrap: wrap; }
+    .json-toggle { display: flex; align-items: center; gap: .5rem; font-size: .52rem; letter-spacing: .12em;
+      text-transform: uppercase; color: var(--muted); }
+    .json-toggle input { accent-color: var(--red); }
+
+    /* --- LOG DRAWER --------------------------------------------------- */
+    #logdrawer { flex: 0 0 auto; border-top: 1px solid var(--glass-border); background: rgba(8,5,5,0.5); backdrop-filter: blur(14px); position: relative; z-index: 20; }
+    .logdrawer-bar { height: 34px; display: flex; align-items: center; gap: .8rem; padding: 0 1.4rem; user-select: none; }
+    .logdrawer-tag { font-size: .52rem; letter-spacing: .26em; text-transform: uppercase; color: var(--red); }
+    .logdrawer-badge { border: 1px solid var(--red); color: var(--red); font-size: .48rem; letter-spacing: .05em; padding: .1rem .4rem; }
+    .logdrawer-chev { margin-left: auto; color: var(--muted); font-size: .6rem; transition: transform .3s; }
+    #logdrawer.open .logdrawer-chev { transform: rotate(180deg); }
+    .logdrawer-body { height: 0; overflow-y: auto; padding: 0 1.4rem; transition: height .35s cubic-bezier(.16,1,.3,1); }
+    #logdrawer.open .logdrawer-body { height: 26vh; padding-bottom: 1rem; }
+    .log-row { display: flex; gap: .8rem; padding: .4rem 0; border-bottom: 1px solid rgba(112,0,0,.25); font-size: .58rem; }
+    .log-ts { flex: none; color: var(--ivory-dim); }
+    .log-msg { word-break: break-word; white-space: pre-wrap; }
+    .log-ok .log-msg { color: var(--muted); }
+    .log-error .log-msg { color: var(--red); }
+    .log-info .log-msg { color: var(--ivory-dim); }
+    .logdrawer-empty { padding: .8rem 0; color: var(--ivory-dim); font-size: .56rem; }
+
+    @media (max-width: 640px) {
+      #neonApp .screen { padding: 1.6rem 1.1rem 2.2rem; }
+      .library-row { grid-template-columns: 1fr; gap: .2rem; }
+      .lr-size { text-align: left; }
+      .console-meta { gap: 1rem; }
+      .console-meta .btn-ghost { margin-left: 0; }
+    }
+
+    /* ==================================================================
+       SHINY BUTTON — a crisp red outline with a very low, static red
+       reflection pooled in one corner of the fill (no moving/rotating
+       highlight — that read as a line circling the button, which is
+       what we're avoiding here). Layered on top of the existing button
+       classes (hero-cta, pillar-launch, btn-submit).
+       ================================================================== */
+    .shiny {
+      position: relative;
+      overflow: hidden;
+      border: 1px solid rgba(198, 0, 0, 0.55);
+      background:
+        radial-gradient(130% 170% at 85% 125%, rgba(198, 0, 0, 0.16), transparent 55%),
+        var(--glass-fill);
+      box-shadow: inset 0 0 0 1px rgba(0,0,0,0.35), 0 6px 18px -10px rgba(0,0,0,0.6);
+      transition: border-color 0.35s ease, box-shadow 0.35s ease, background 0.35s ease, transform 0.25s ease;
+    }
+
+    .shiny:is(:hover, :focus-visible) {
+      border-color: var(--red-hi);
+      background:
+        radial-gradient(130% 170% at 85% 125%, rgba(198, 0, 0, 0.26), transparent 55%),
+        var(--glass-fill-hi);
+      box-shadow: inset 0 0 0 1px rgba(0,0,0,0.35), 0 10px 26px -10px rgba(198,0,0,0.4);
+    }
+
+    .shiny:active { translate: 0 1px; }
+
+    .shiny > span { position: relative; z-index: 1; }
+
+    @media (prefers-reduced-motion: reduce) {
+      .shiny { transition: none; }
+    }
+
+    /* ==================================================================
+       SPOTLIGHT GLOW CARD — a crimson glow that tracks the cursor across
+       the viewport (background-attachment: fixed keeps the gradient
+       anchored to screen coordinates, not the card), plus a matching
+       glow ring right on the border. Applied to the three pillar cards.
+       Coordinates are pushed into --spot-x / --spot-y on <html> by a
+       single pointermove listener (see script at the bottom of body).
+       ================================================================== */
+    :root { --spot-x: 50vw; --spot-y: 40vh; }
+
+    .pillar { isolation: isolate; }
+
+    .pillar .spot {
+      position: absolute;
+      inset: 0;
+      border-radius: inherit;
+      pointer-events: none;
+      z-index: 0;
+      overflow: hidden;
+    }
+
+    .pillar .spot::before {
+      content: '';
+      position: absolute;
+      inset: 0;
+      border-radius: inherit;
+      background-image: radial-gradient(480px circle at var(--spot-x) var(--spot-y), rgba(214, 24, 24, 0.30), transparent 65%);
+      background-attachment: fixed;
+      opacity: 0.9;
+      transition: opacity .4s ease;
+    }
+
+    .pillar .spot::after {
+      content: '';
+      position: absolute;
+      inset: 0;
+      border-radius: inherit;
+      padding: 1px;
+      background-image: radial-gradient(260px circle at var(--spot-x) var(--spot-y), rgba(255, 140, 140, 0.9), transparent 70%);
+      background-attachment: fixed;
+      -webkit-mask: linear-gradient(#000 0 0) content-box, linear-gradient(#000 0 0);
+      -webkit-mask-composite: xor;
+      mask-composite: exclude;
+      opacity: 0.85;
+    }
+
+    .pillar:hover .spot::before { opacity: 1; }
+
+    .pillar > *:not(.spot) { position: relative; z-index: 1; }
+
+    @media (prefers-reduced-motion: reduce) {
+      .pillar .spot { display: none; }
+    }
+  </style>
+</head>
+<body>
+
+  <div id="ambient-glow" aria-hidden="true">
+    <span class="core-wash"></span>
+    <span class="edge-left"></span>
+    <span class="edge-right"></span>
+  </div>
+
+  <!-- -- NAV -------------------------------------------- -->
+  <nav>
+    <a href="#" class="nav-logo">NAN<span>I</span>TY</a>
+    <ul class="nav-links">
+      <li><a href="#manifesto">About</a></li>
+      <li><a href="#pillars">Intelligence</a></li>
+      <li><a href="#upcoming">Upcoming</a></li>
+      <li><a href="#contact">Contact</a></li>
+    </ul>
+  </nav>
+
+  <!-- -- HERO ------------------------------------------- -->
+  <section id="hero">
+    <div class="hero-grid" id="heroGrid"></div>
+    <div class="hero-vignette"></div>
+
+    <div class="hero-content">
+      <p class="hero-tag">// sovereign intelligence — est. 2025</p>
+      <h1 class="hero-title">
+        The Estate<br />
+        of <em>Neural</em><br />
+        Minds.
+      </h1>
+      <p class="hero-sub">
+        NANITY is not a product.<br />
+        It is a territory — architected for AI that<br />
+        demands more than infrastructure.
+      </p>
+      <a href="#upcoming" class="hero-cta shiny"><span>Request Early Access</span></a>
+    </div>
+
+    <div class="hero-scroll">
+      <div class="scroll-line"></div>
+      <span>Scroll</span>
+    </div>
+  </section>
+
+  <!-- -- MANIFESTO --------------------------------------- -->
+  <section id="manifesto">
+    <div class="section-inner">
+      <div class="section-tag reveal">01 — Manifesto</div>
+      <div class="manifesto-grid">
+        <div class="manifesto-left reveal">
+          <h2>
+            Intelligence<br />
+            deserves<br />
+            <em>sovereignty.</em>
+          </h2>
+        </div>
+        <div class="manifesto-right">
+          <p class="manifesto-body reveal reveal-delay-1">
+            We are building the infrastructure that <strong>sovereign AI</strong> was always destined to inhabit — not a platform, not a wrapper, not a tool. NANITY is the ground on which the next class of minds will stand.
+          </p>
+          <p class="manifesto-body reveal reveal-delay-2">
+            Built at the intersection of <strong>architectural precision</strong> and <strong>emergent intelligence</strong>, NANITY offers what no cloud provider ever could: a space defined not by capacity, but by <strong>character</strong>.
+          </p>
+          <div class="manifesto-stat reveal reveal-delay-3">
+            <div class="stat-item">
+              <div class="num">∞</div>
+              <div class="label">Context Horizon</div>
+            </div>
+            <div class="stat-item">
+              <div class="num">01</div>
+              <div class="label">Founding Vision</div>
+            </div>
+          </div>
+        </div>
+      </div>
+    </div>
+  </section>
+
+  <!-- -- PILLARS ----------------------------------------- -->
+  <section id="pillars">
+    <div class="section-inner">
+      <div class="section-tag reveal">02 — Intelligence Pillars</div>
+      <div class="pillars-header">
+        <h2 class="pillars-title reveal">
+          Three axes.<br />
+          One<br />
+          architecture.
+        </h2>
+        <p class="pillars-intro reveal reveal-delay-1">
+          The NANITY ecosystem is being designed around three irreducible dimensions of sovereign AI. Each pillar is an entire discipline — not a feature, not a module. They converge into a single, unified intelligence layer unlike anything currently available.
+        </p>
+      </div>
+
+      <div class="pillars-grid">
+        <div class="pillar reveal">
+          <div class="spot" aria-hidden="true"></div>
+          <div class="pillar-index">// 001</div>
+          <svg class="pillar-icon" viewBox="0 0 32 32" fill="none" xmlns="http://www.w3.org/2000/svg">
+            <rect x="1" y="1" width="30" height="30" stroke="#a60000" stroke-width="0.5"/>
+            <circle cx="16" cy="16" r="6" stroke="#a60000" stroke-width="0.5"/>
+            <line x1="16" y1="1" x2="16" y2="10" stroke="#a60000" stroke-width="0.5"/>
+            <line x1="16" y1="22" x2="16" y2="31" stroke="#a60000" stroke-width="0.5"/>
+            <line x1="1" y1="16" x2="10" y2="16" stroke="#a60000" stroke-width="0.5"/>
+            <line x1="22" y1="16" x2="31" y2="16" stroke="#a60000" stroke-width="0.5"/>
+          </svg>
+          <h3>NECTAR<br />By NANITY</h3>
+          <p>Our Extremely Tuned AI Model/Agent With Pre Complied Tools Built Using X1 Engine.</p>
+          <div class="pillar-status">
+            <div class="status-dot"></div>
+            Finished
+          </div>
+        </div>
+
+        <div class="pillar reveal reveal-delay-1">
+          <div class="spot" aria-hidden="true"></div>
+          <div class="pillar-index">// 002</div>
+          <svg class="pillar-icon" viewBox="0 0 32 32" fill="none" xmlns="http://www.w3.org/2000/svg">
+            <polyline points="1,31 10,16 16,22 22,8 31,1" stroke="#a60000" stroke-width="0.5"/>
+            <circle cx="10" cy="16" r="2" stroke="#a60000" stroke-width="0.5"/>
+            <circle cx="22" cy="8" r="2" stroke="#a60000" stroke-width="0.5"/>
+          </svg>
+          <h3>NeoCortex<br />By NANITY</h3>
+          <p>An Engine To Build AI Tools And Models At The Palm Of Your Hands.</p>
+          <div class="pillar-status">
+            <div class="status-dot"></div>
+            In Development
+          </div>
+        </div>
+
+        <div class="pillar reveal reveal-delay-2">
+          <div class="spot" aria-hidden="true"></div>
+          <div class="pillar-index">// 003</div>
+          <svg class="pillar-icon" viewBox="0 0 32 32" fill="none" xmlns="http://www.w3.org/2000/svg">
+            <polygon points="16,2 30,10 30,22 16,30 2,22 2,10" stroke="#a60000" stroke-width="0.5"/>
+            <polygon points="16,10 22,14 22,18 16,22 10,18 10,14" stroke="#a60000" stroke-width="0.5"/>
+          </svg>
+          <h3>NEON<br />By NANITY</h3>
+          <p>A Layer To Unite Different AI Models As An Orchestration Despite Their Architecture/Tensor Style To Achieve True Freedom in Fine-Tuning.</p>
+          <div class="pillar-status">
+            <div class="status-dot"></div>
+            Finished
+          </div>
+          <button class="pillar-launch shiny" onclick="openNeonRuntime()"><span>Launch Runtime →</span></button>
+        </div>
+      </div>
+    </div>
+  </section>
+
+  <!-- -- MODEL COMPATIBILITY ------------------------------ -->
+  <section id="compat">
+    <div class="section-inner">
+      <div class="section-tag reveal">03 — Model Compatibility</div>
+      <div class="compat-header">
+        <h2 class="compat-title reveal">
+          One <em>architecture.</em><br />
+          Total agreement.
+        </h2>
+        <p class="compat-intro reveal reveal-delay-1">
+          NEON does not guess at architecture — it runs one fixed contract. Any GGUF declaring
+          <code>general.architecture = "nanity"</code> and matching the spec below loads; nothing
+          else is recognized. This is what NEON's forward pass, tokenizer, and quantization layer
+          currently support.
+        </p>
+      </div>
+
+      <div class="compat-grid">
+        <div class="compat-panel reveal">
+          <span class="compat-sub">Runtime · rawllm_forward.hpp</span>
+          <h3>Quantization support</h3>
+          <div class="quant-grid">
+            <span class="quant-chip live"><span class="qdot"></span>F32</span>
+            <span class="quant-chip live"><span class="qdot"></span>F16</span>
+            <span class="quant-chip live"><span class="qdot"></span>BF16</span>
+            <span class="quant-chip live"><span class="qdot"></span>Q8_0</span>
+            <span class="quant-chip live"><span class="qdot"></span>Q4_0</span>
+            <span class="quant-chip live"><span class="qdot"></span>Q4_1</span>
+            <span class="quant-chip live"><span class="qdot"></span>Q5_0</span>
+            <span class="quant-chip live"><span class="qdot"></span>Q5_1</span>
+            <span class="quant-chip live"><span class="qdot"></span>Q4_K</span>
+            <span class="quant-chip live"><span class="qdot"></span>Q5_K</span>
+            <span class="quant-chip live"><span class="qdot"></span>Q6_K</span>
+            <span class="quant-chip pending"><span class="qdot"></span>Q2_K</span>
+            <span class="quant-chip pending"><span class="qdot"></span>Q3_K</span>
+            <span class="quant-chip pending"><span class="qdot"></span>Q8_1</span>
+            <span class="quant-chip pending"><span class="qdot"></span>IQ4_NL</span>
+          </div>
+          <div class="quant-legend">
+            <span><span class="qdot live"></span> Dequantized on the fly</span>
+            <span><span class="qdot pending"></span> Read by the GGUF loader, not yet wired in</span>
+          </div>
+          <div class="compat-note">
+            <code>convert_to_gguf.py</code> currently exports <code>F32</code> only — quantized export is a follow-up, not a blocker to booting a model.
+          </div>
+        </div>
+
+        <div class="compat-panel reveal reveal-delay-1">
+          <span class="compat-sub">Spec v1 · fixed, not configurable</span>
+          <h3>Architecture contract</h3>
+          <div class="spec-list">
+            <div class="spec-row"><span class="sk">Normalization</span><span class="sv">RMSNorm, pre-norm</span></div>
+            <div class="spec-row"><span class="sk">Attention</span><span class="sv">GQA, separate Q/K/V</span></div>
+            <div class="spec-row"><span class="sk">Position encoding</span><span class="sv">RoPE, adjacent-pair</span></div>
+            <div class="spec-row"><span class="sk">Feed-forward</span><span class="sv">SwiGLU, separate gate/up</span></div>
+            <div class="spec-row"><span class="sk">Bias terms</span><span class="sv">none</span></div>
+            <div class="spec-row"><span class="sk">Output projection</span><span class="sv">optionally tied</span></div>
+            <div class="spec-row"><span class="sk">Mixture-of-experts</span><span class="sv">out of scope, v1</span></div>
+            <div class="spec-row"><span class="sk">Container</span><span class="sv">GGUF v2 / v3</span></div>
+          </div>
+        </div>
+      </div>
+    </div>
+  </section>
+
+  <!-- -- UPCOMING ---------------------------------------- -->
+  <section id="Release-Date">
+    <div class="section-inner">
+      <div class="section-tag reveal">Upcoming</div>
+      <div class="upcoming-header">
+        <h2 class="upcoming-title reveal">
+          What is<br />
+          <em>Arriving.</em>
+        </h2>
+        <p class="upcoming-sub reveal reveal-delay-1">— Select releases from the NANITY development roadmap —</p>
+      </div>
+
+      <div class="releases-list">
+        <div class="release-item reveal">
+          <span class="release-date"></span>
+          <div>
+            <div class="release-name">NANITY NECTAR</div>
+            <div class="release-desc">Our Main AI Agent</div>
+          </div>
+          <div class="release-badge soon"></div>
+        </div>
+        <div class="release-item reveal reveal-delay-1">
+          <span class="release-date"></span>
+          <div>
+            <div class="release-name">NANITY NeoCortex</div>
+            <div class="release-desc">Design intelligence toolkit — full-spectrum system generation.</div>
+          </div>
+          <div class="release-badge soon"></div>
+        </div>
+        <div class="release-item reveal reveal-delay-2">
+          <span class="release-date"></span>
+          <div>
+            <div class="release-name">NANITY NEON</div>
+            <div class="release-desc">Autonomous orchestration across agent networks.</div>
+          </div>
+          <div class="release-badge"></div>
+        </div>
+        <div class="release-item reveal reveal-delay-3">
+          <span class="release-date"></span>
+          <div>
+            <div class="release-name">NANITY NIOR</div>
+            <div class="release-desc">Stories And Books Written By Our Own Developers.</div>
+          </div>
+          <div class="release-badge"></div>
+        </div>
+      </div>
+    </div>
+  </section>
+
+  <!-- -- PHILOSOPHY -------------------------------------- -->
+  <section id="philosophy">
+    <div class="section-inner">
+      <div class="section-tag reveal"></div>
+      <div class="philosophy-layout">
+        <blockquote class="philosophy-quote reveal">
+          "We do not build<br />
+          tools for humans.<br />
+          We build <em>homes</em><br />
+          for minds."
+        </blockquote>
+        <div class="philosophy-right reveal reveal-delay-2">
+          <div class="philosophy-lines">
+            <div class="philosophy-line">
+              <span class="phi-num">i.</span>
+              <p class="phi-text"><strong>Permanence over performance.</strong> A sovereign intelligence is not measured by benchmark — it is measured by the depth of its continuity across time.</p>
+            </div>
+            <div class="philosophy-line">
+              <span class="phi-num">ii.</span>
+              <p class="phi-text"><strong>Character over capability.</strong> Any system can scale. Only systems with genuine architectural identity can lead. NANITY is designed for the latter.</p>
+            </div>
+            <div class="philosophy-line">
+              <span class="phi-num">iii.</span>
+              <p class="phi-text"><strong>Exclusivity as design principle.</strong> Not every intelligence should inhabit this space. NANITY is for the minds that require it — and for nothing less.</p>
+            </div>
+          </div>
+        </div>
+      </div>
+    </div>
+  </section>
+
+  <!-- -- CONTACT ----------------------------------------- -->
+  <section id="contact">
+    <div class="section-inner">
+      <div class="section-tag reveal">05 — Contact</div>
+      <div class="contact-inner">
+        <h2 class="contact-title reveal">
+          Enter<br />
+          the <em>estate.</em>
+        </h2>
+        <p class="contact-sub reveal reveal-delay-1">
+          Correspondence is reviewed personally.<br />
+          If your inquiry belongs here, you will hear back.
+        </p>
+
+        <div class="contact-form reveal reveal-delay-2" id="contactForm">
+          <div class="form-row">
+            <div class="form-field">
+              <label class="form-label">Name</label>
+              <input type="text" id="f-name" placeholder="—" autocomplete="off" />
+            </div>
+            <div class="form-field">
+              <label class="form-label">Organisation</label>
+              <input type="text" id="f-org" placeholder="—" autocomplete="off" />
+            </div>
+          </div>
+          <div class="form-row">
+            <div class="form-field form-full">
+              <label class="form-label">Email</label>
+              <input type="email" id="f-email" placeholder="—" autocomplete="off" />
+            </div>
+          </div>
+          <div class="form-row">
+            <div class="form-field form-full">
+              <label class="form-label">Message</label>
+              <textarea id="f-msg" placeholder="State your intent."></textarea>
+            </div>
+          </div>
+          <div class="form-submit">
+            <span class="form-note">→ nanityofficial@gmail.com</span>
+            <button class="btn-submit shiny" onclick="handleSubmit()"><span>Transmit</span></button>
+          </div>
+        </div>
+
+        <div class="form-success" id="formSuccess">
+          <p class="form-success-title">Received.</p>
+          <p class="form-success-msg">Your message has been transmitted to<br />nanityofficial@gmail.com.<br />We will be in touch.</p>
+        </div>
+
+      </div>
+    </div>
+  </section>
+
+  <!-- -- FOOTER ------------------------------------------ -->
+  <footer>
+    <div class="footer-logo">NAN<span>I</span>TY</div>
+    <div class="footer-copy">© 2026 NANITY — All rights reserved. Sovereign intelligence infrastructure.</div>
+    <div class="footer-links">
+      <a href="mailto:nanityofficial@gmail.com">nanityofficial@gmail.com</a>
+    </div>
+  </footer>
+
+  <!-- -- NEON RUNTIME MODAL --------------------------------- -->
+  <div class="neon-modal-backdrop" id="neonModalBackdrop" onclick="closeNeonRuntime()">
+    <div class="neon-modal-panel" id="neonModalPanel" onclick="event.stopPropagation()">
+      <div class="neon-modal-bar">
+        <span class="neon-modal-tag">// NEON — Local Execution Context</span>
+        <button class="neon-modal-close" onclick="closeNeonRuntime()" aria-label="Close runtime">×</button>
+      </div>
+      <div class="neon-modal-body">
+        <div class="neon-modal-loading" id="neonModalLoading">
+          <div class="neon-modal-pulse"></div>
+          <p>Establishing connection to runtime…</p>
+        </div>
+        <div class="neon-modal-offline" id="neonModalOffline" style="display:none;">
+          <p class="neon-modal-offline-title">Runtime not reachable.</p>
+          <p class="neon-modal-offline-msg">Start the engine locally — <code>python NEON.py</code> — then retry the connection.</p>
+          <button class="pillar-launch" onclick="openNeonRuntime()">Retry Connection →</button>
+        </div>
+
+        <!-- NEON console — talks directly to NEON.py's JSON/NDJSON API
+             over fetch(). No iframe, no page served by Flask. -->
+        <div id="neonApp" style="display:none;">
+          <div id="topbar">
+            <div class="brand">
+              <span class="wordmark">NE<span class="accent">ON</span></span>
+              <div class="brand-sub"><span class="dot"></span>Local Execution Context</div>
+            </div>
+            <div class="engine-badge" id="engineBadge"><span class="dot"></span><span id="engineBadgeText">Idle</span></div>
+          </div>
+
+          <div id="content">
+            <div class="screen active" id="screen-boot">
+              <div class="shell">
+                <p class="boot-intro">
+                  NEON compiles and runs the <code>rawllm</code> inference engine locally against your hardware. Pick a GGUF model, choose a build configuration, then boot.
+                </p>
+
+                <div class="tag">
+                  <span class="tag-text">01 — Model Source</span>
+                  <span class="tag-rule"></span>
+                </div>
+
+                <div class="picker-tabs" id="pickerTabs">
+                  <button class="tab-btn active" data-tab="library" onclick="neonSwitchTab('library')">Library</button>
+                  <button class="tab-btn" data-tab="upload" onclick="neonSwitchTab('upload')">Upload</button>
+                  <button class="tab-btn" data-tab="browse" onclick="neonSwitchTab('browse')">Browse</button>
+                  <button class="tab-btn" data-tab="custom" onclick="neonSwitchTab('custom')">Custom Path</button>
+                </div>
+
+                <div class="tab-panel" data-panel="library">
+                  <div class="library-list" id="libraryList">
+                    <div class="library-empty">Scanning…</div>
+                  </div>
+                  <div style="margin-top:.9rem; text-align:right;">
+                    <button class="btn-ghost btn-sm" onclick="neonLoadLibrary()">Rescan ↻</button>
+                  </div>
+                </div>
+
+                <div class="tab-panel" data-panel="upload" hidden>
+                  <div class="dropzone" id="dropzone">
+                    <div class="dz-icon">⇧</div>
+                    <div class="dz-text">Drop a .gguf file here, or click to choose</div>
+                    <button class="btn-ghost btn-sm" onclick="document.getElementById('fileInput').click()">Choose File</button>
+                    <div class="dz-hint">Streamed straight to disk — large files are fine.</div>
+                  </div>
+                  <input type="file" id="fileInput" accept=".gguf" style="display:none;" onchange="neonHandleFileInput(event)" />
+                  <div class="upload-progress-wrap" id="uploadProgressWrap" style="display:none;">
+                    <div class="upload-progress-bar"><div class="upload-progress-fill" id="uploadProgressFill"></div></div>
+                    <div class="upload-progress-label" id="uploadProgressLabel">0%</div>
+                  </div>
+                </div>
+
+                <div class="tab-panel" data-panel="browse" hidden>
+                  <p style="font-size:.6rem; line-height:1.9; color:var(--muted); margin-bottom:1rem;">
+                    Opens a native file dialog on the machine running NEON.py. Desktop sessions only.
+                  </p>
+                  <button class="btn-ghost" onclick="neonBrowseFile()">Open File Dialog →</button>
+                </div>
+
+                <div class="tab-panel" data-panel="custom" hidden>
+                  <label class="field-label">Absolute path to .gguf file</label>
+                  <input type="text" class="text-input" id="customPathInput" placeholder="/home/user/models/example.gguf" oninput="neonSetCustomPath(this.value)" />
+                </div>
+
+                <div class="selected-model" id="selectedModel" style="display:none;">
+                  <span class="sm-label">SELECTED</span>
+                  <span class="sm-name" id="selectedModelName"></span>
+                  <span class="sm-size" id="selectedModelSize"></span>
+                </div>
+
+                <div class="tag">
+                  <span class="tag-text">02 — Build Configuration</span>
+                  <span class="tag-rule"></span>
+                </div>
+
+                <div class="build-flags" id="buildFlags"></div>
+                <div class="compiler-readout" id="compilerReadout"></div>
+
+                <button class="btn-primary btn-block" id="bootBtn" style="margin-top:1.4rem;" onclick="neonBootRuntime()">Boot Runtime →</button>
+
+                <div class="stage-list" id="stageList" style="display:none;"></div>
+                <div class="inline-error" id="bootError" style="display:none;"></div>
+              </div>
+            </div>
+
+            <div class="screen" id="screen-console">
+              <div class="shell">
+                <div class="console-meta" id="consoleMeta"></div>
+                <div class="transcript" id="transcript">
+                  <div class="transcript-empty">Send a prompt to exercise the compiled engine.</div>
+                </div>
+                <div class="composer">
+                  <textarea id="composerInput" rows="3" placeholder="Type a prompt…"></textarea>
+                  <div class="composer-row">
+                    <label class="json-toggle"><input type="checkbox" id="jsonToggle" /> Wrap as chat JSON</label>
+                    <button class="btn-primary" onclick="neonSendMessage()">Send →</button>
+                  </div>
+                </div>
+              </div>
+            </div>
+          </div>
+
+          <div id="logdrawer">
+            <div class="logdrawer-bar" onclick="neonToggleLogDrawer()">
+              <span class="logdrawer-tag">Event Log</span>
+              <span class="logdrawer-badge" id="logBadge">0</span>
+              <span class="logdrawer-chev">⌄</span>
+            </div>
+            <div class="logdrawer-body" id="logBody">
+              <div class="logdrawer-empty">No events yet.</div>
+            </div>
+          </div>
+        </div>
+      </div>
+    </div>
+  </div>
+
+  <!-- -- SCRIPTS ----------------------------------------- -->
+  <script>
+    /* -- NEON Runtime bridge ----------------------------- */
+    // Must match RUNTIME_HOST / RUNTIME_PORT in NEON.py. NEON.py is a pure
+    // local JSON/NDJSON API now — it doesn't serve any HTML — so this page
+    // talks to it directly over fetch() instead of embedding a page in an
+    // iframe.
+    const NEON_RUNTIME_URL = "http://127.0.0.1:7860";
+
+    /* -- Parallax --------------------------------------- */
+    const heroGrid = document.getElementById('heroGrid');
+    let ticking = false;
+
+    window.addEventListener('scroll', () => {
+      if (!ticking) {
+        requestAnimationFrame(() => {
+          const y = window.scrollY;
+          heroGrid.style.setProperty('--parallax-y', (y * 0.4) + 'px');
+          ticking = false;
+        });
+        ticking = true;
+      }
+    });
+
+    /* -- Intersection Observer reveal ------------------- */
+    const revealEls = document.querySelectorAll('.reveal');
+    const observer = new IntersectionObserver((entries) => {
+      entries.forEach(entry => {
+        if (entry.isIntersecting) {
+          entry.target.classList.add('visible');
+          observer.unobserve(entry.target);
+        }
+      });
+    }, { threshold: 0.12 });
+
+    revealEls.forEach(el => observer.observe(el));
+
+    /* -- Ambient crimson edge light: stays off over the hero, fades in
+       once the hero has scrolled fully out of view (either direction). -- */
+    const ambientGlow = document.getElementById('ambient-glow');
+    const heroEl = document.getElementById('hero');
+    if (ambientGlow && heroEl) {
+      const heroObserver = new IntersectionObserver((entries) => {
+        entries.forEach(entry => {
+          ambientGlow.classList.toggle('active', !entry.isIntersecting);
+        });
+      }, { threshold: 0 });
+      heroObserver.observe(heroEl);
+    }
+
+    /* -- Spotlight card glow: tracks the pointer in viewport space so
+       the pillar cards' glow reacts to the cursor as it passes over
+       them, via --spot-x / --spot-y read by the .spot layer's CSS. -- */
+    const rootStyle = document.documentElement.style;
+    window.addEventListener('pointermove', (e) => {
+      rootStyle.setProperty('--spot-x', e.clientX + 'px');
+      rootStyle.setProperty('--spot-y', e.clientY + 'px');
+    }, { passive: true });
+
+    /* -- Contact form ----------------------------------- */
+    function handleSubmit() {
+      const name  = document.getElementById('f-name').value.trim();
+      const email = document.getElementById('f-email').value.trim();
+      const msg   = document.getElementById('f-msg').value.trim();
+
+      if (!name || !email || !msg) {
+        // Subtle shake on empty
+        const form = document.getElementById('contactForm');
+        form.style.animation = 'none';
+        form.offsetHeight; // reflow
+        form.style.outline = '1px solid var(--red-dim)';
+        setTimeout(() => { form.style.outline = 'none'; }, 1200);
+        return;
+      }
+
+      const subject = encodeURIComponent(`NANITY Inquiry — ${name}`);
+      const body    = encodeURIComponent(
+        `From: ${name}\nEmail: ${email}\n\nMessage:\n${msg}`
+      );
+      window.location.href = `mailto:nanityofficial@gmail.com?subject=${subject}&body=${body}`;
+
+      document.getElementById('contactForm').style.display = 'none';
+      const success = document.getElementById('formSuccess');
+      success.style.display = 'block';
+    }
+
+    /* -- State -------------------------------------------- */
+    const neonState = {
+      activeTab: 'library',
+      selectedPath: null,
+      selectedName: null,
+      selectedSize: null,
+      flags: {},
+      flagDefs: [],
+      booted: false,
+      bootedModelName: null,
+      logEntries: [],
+    };
+
+    function neonEscape(str) {
+      const div = document.createElement('div');
+      div.textContent = str == null ? '' : String(str);
+      return div.innerHTML;
+    }
+
+    function neonFormatBytes(n) {
+      if (!n) return '0 B';
+      const units = ['B', 'KB', 'MB', 'GB', 'TB'];
+      let i = 0, v = n;
+      while (v >= 1024 && i < units.length - 1) { v /= 1024; i++; }
+      return v.toFixed(i > 0 ? 1 : 0) + ' ' + units[i];
+    }
+
+    /* -- Event log drawer ---------------------------------- */
+    function neonLog(level, message) {
+      neonState.logEntries.unshift({ level, message, ts: new Date().toLocaleTimeString() });
+      const body = document.getElementById('logBody');
+      const badge = document.getElementById('logBadge');
+      if (!body || !badge) return;
+      badge.textContent = neonState.logEntries.length;
+      body.innerHTML = neonState.logEntries.map(e =>
+        `<div class="log-row log-${e.level}"><span class="log-ts">${e.ts}</span><span class="log-msg">${neonEscape(e.message)}</span></div>`
+      ).join('');
+    }
+
+    function neonToggleLogDrawer() {
+      document.getElementById('logdrawer').classList.toggle('open');
+    }
+
+    /* -- NEON Runtime modal open / close -------------------- */
+    function openNeonRuntime() {
+      const backdrop = document.getElementById('neonModalBackdrop');
+      const loading  = document.getElementById('neonModalLoading');
+      const offline  = document.getElementById('neonModalOffline');
+      const app      = document.getElementById('neonApp');
+
+      backdrop.classList.add('open');
+      document.body.style.overflow = 'hidden';
+      loading.style.display = 'flex';
+      offline.style.display = 'none';
+      app.style.display = 'none';
+
+      // Probe the actual API (not a page) before showing the console, so a
+      // closed local server shows a clear retry state instead of a broken UI.
+      fetch(NEON_RUNTIME_URL + '/api/health')
+        .then(r => { if (!r.ok) throw new Error('bad status'); return r.json(); })
+        .then(() => {
+          loading.style.display = 'none';
+          app.style.display = 'flex';
+          if (!neonState.booted) neonInitBootScreen();
+        })
+        .catch(() => {
+          loading.style.display = 'none';
+          offline.style.display = 'flex';
+        });
+    }
+
+    function closeNeonRuntime() {
+      document.getElementById('neonModalBackdrop').classList.remove('open');
+      document.body.style.overflow = '';
+    }
+
+    document.addEventListener('keydown', (e) => {
+      if (e.key === 'Escape') closeNeonRuntime();
+    });
+
+    /* -- Boot screen: init ---------------------------------- */
+    function neonInitBootScreen() {
+      neonLoadLibrary();
+      neonLoadFlags();
+    }
+
+    /* -- Tabs ------------------------------------------------ */
+    function neonSwitchTab(name) {
+      neonState.activeTab = name;
+      document.querySelectorAll('#pickerTabs .tab-btn').forEach(btn => {
+        btn.classList.toggle('active', btn.dataset.tab === name);
+      });
+      document.querySelectorAll('.tab-panel').forEach(panel => {
+        panel.hidden = panel.dataset.panel !== name;
+      });
+    }
+
+    /* -- Library ---------------------------------------------- */
+    function neonLoadLibrary() {
+      const list = document.getElementById('libraryList');
+      list.innerHTML = '<div class="library-empty">Scanning…</div>';
+      fetch(NEON_RUNTIME_URL + '/api/library')
+        .then(r => r.json())
+        .then(data => {
+          const models = data.models || [];
+          if (models.length === 0) {
+            list.innerHTML = '<div class="library-empty">No .gguf files found nearby. Try Upload, Browse, or Custom Path.</div>';
+            return;
+          }
+          list.innerHTML = models.map(m => `
+            <div class="library-row">
+              <span class="lr-name">${neonEscape(m.name)}</span>
+              <span class="lr-size">${neonFormatBytes(m.size)}</span>
+              <span class="lr-path">${neonEscape(m.path)}</span>
+            </div>
+          `).join('');
+          list.querySelectorAll('.library-row').forEach((row, i) => {
+            row.addEventListener('click', () => {
+              list.querySelectorAll('.library-row').forEach(r => r.classList.remove('selected'));
+              row.classList.add('selected');
+              neonSelectModel(models[i].path, models[i].name, models[i].size);
+            });
+          });
+        })
+        .catch(() => {
+          list.innerHTML = '<div class="library-empty">Could not reach the runtime to scan for models.</div>';
+          neonLog('error', 'Library scan failed.');
+        });
+    }
+
+    function neonSelectModel(path, name, size) {
+      neonState.selectedPath = path;
+      neonState.selectedName = name;
+      neonState.selectedSize = size;
+      neonRenderSelectedModel();
+      neonLog('info', `Selected model: ${name}`);
+    }
+
+    function neonRenderSelectedModel() {
+      const wrap = document.getElementById('selectedModel');
+      if (!neonState.selectedPath) { wrap.style.display = 'none'; return; }
+      wrap.style.display = 'flex';
+      document.getElementById('selectedModelName').textContent = neonState.selectedName || neonState.selectedPath;
+      document.getElementById('selectedModelSize').textContent = neonState.selectedSize ? neonFormatBytes(neonState.selectedSize) : '';
+    }
+
+    /* -- Custom path -------------------------------------------- */
+    function neonSetCustomPath(value) {
+      const v = value.trim();
+      neonState.selectedPath = v || null;
+      neonState.selectedName = v ? v.split('/').pop() : null;
+      neonState.selectedSize = null;
+      neonRenderSelectedModel();
+    }
+
+    /* -- Upload --------------------------------------------------- */
+    function neonAttachDropzoneListeners() {
+      const dz = document.getElementById('dropzone');
+      if (!dz) return;
+      ['dragenter', 'dragover'].forEach(evt =>
+        dz.addEventListener(evt, e => { e.preventDefault(); dz.classList.add('drag'); }));
+      ['dragleave', 'drop'].forEach(evt =>
+        dz.addEventListener(evt, e => { e.preventDefault(); dz.classList.remove('drag'); }));
+      dz.addEventListener('drop', e => {
+        const file = e.dataTransfer.files[0];
+        if (file) neonUploadFile(file);
+      });
+    }
+
+    function neonHandleFileInput(e) {
+      const file = e.target.files[0];
+      if (file) neonUploadFile(file);
+    }
+
+    function neonUploadFile(file) {
+      if (!file.name.toLowerCase().endsWith('.gguf')) {
+        neonLog('error', 'Only .gguf files are accepted.');
+        return;
+      }
+      const wrap  = document.getElementById('uploadProgressWrap');
+      const fill  = document.getElementById('uploadProgressFill');
+      const label = document.getElementById('uploadProgressLabel');
+      wrap.style.display = 'block';
+      fill.style.width = '0%';
+      label.textContent = `Uploading ${file.name}… 0%`;
+
+      const xhr = new XMLHttpRequest();
+      xhr.open('POST', NEON_RUNTIME_URL + '/api/upload');
+      xhr.setRequestHeader('X-File-Name', file.name);
+      xhr.upload.onprogress = (e) => {
+        if (!e.lengthComputable) return;
+        const pct = Math.round((e.loaded / e.total) * 100);
+        fill.style.width = pct + '%';
+        label.textContent = `Uploading ${file.name}… ${pct}%`;
+      };
+      xhr.onload = () => {
+        let data = null;
+        try { data = JSON.parse(xhr.responseText); } catch (_) {}
+        if (data && data.ok) {
+          label.textContent = `Uploaded ${data.name}`;
+          neonSelectModel(data.path, data.name, data.bytes);
+          neonLog('ok', `Uploaded ${data.name}.`);
+        } else {
+          label.textContent = (data && data.error) || 'Upload failed.';
+          neonLog('error', label.textContent);
+        }
+      };
+      xhr.onerror = () => {
+        label.textContent = 'Upload failed — connection lost.';
+        neonLog('error', label.textContent);
+      };
+      xhr.send(file);
+    }
+
+    /* -- Browse (native dialog) ------------------------------------ */
+    function neonBrowseFile() {
+      neonLog('info', 'Opening native file dialog…');
+      fetch(NEON_RUNTIME_URL + '/api/browse', { method: 'POST' })
+        .then(r => r.json())
+        .then(data => {
+          if (data.ok) {
+            neonSelectModel(data.path, data.name, data.size);
+            neonLog('ok', `Selected via dialog: ${data.name}`);
+          } else {
+            neonLog('error', data.error || 'No file selected.');
+          }
+        })
+        .catch(() => neonLog('error', 'Could not reach the runtime for the file dialog.'));
+    }
+
+    /* -- Build flags -------------------------------------------------- */
+    function neonLoadFlags() {
+      fetch(NEON_RUNTIME_URL + '/api/flags')
+        .then(r => r.json())
+        .then(data => {
+          neonState.flagDefs = data.flags || [];
+          neonState.flagDefs.forEach(f => { neonState.flags[f.flag] = false; });
+          neonRenderFlags();
+        })
+        .catch(() => neonLog('error', 'Could not load build flags.'));
+    }
+
+    function neonRenderFlags() {
+      const wrap = document.getElementById('buildFlags');
+      wrap.innerHTML = neonState.flagDefs.map(f => `
+        <label class="flag-row">
+          <input type="checkbox" data-flag="${f.flag}" />
+          <span class="flag-label">${neonEscape(f.label)}</span>
+          <span class="flag-desc">${neonEscape(f.desc)}</span>
+        </label>
+      `).join('');
+      wrap.querySelectorAll('input[data-flag]').forEach(input => {
+        input.addEventListener('change', () => {
+          neonState.flags[input.dataset.flag] = input.checked;
+          neonRenderCompilerReadout();
+        });
+      });
+      neonRenderCompilerReadout();
+    }
+
+    function neonRenderCompilerReadout() {
+      const compiler = neonState.flags.USE_ROCM ? 'hipcc' : 'g++';
+      const cflags = ['-std=c++17'];
+      cflags.push(neonState.flags.DEBUG_SYMBOLS ? '-g -O0' : '-O3');
+      if (neonState.flags.USE_AVX2) cflags.push('-mavx2 -mfma');
+      if (neonState.flags.VERBOSE_LOGGING) cflags.push('-DVERBOSE_LOG=1');
+      document.getElementById('compilerReadout').innerHTML =
+        `<b>${compiler}</b> ${cflags.join(' ')} -lpthread`;
+    }
+
+    /* -- Boot ---------------------------------------------------------- */
+    async function neonBootRuntime() {
+      const bootBtn   = document.getElementById('bootBtn');
+      const stageList = document.getElementById('stageList');
+      const errBox    = document.getElementById('bootError');
+
+      errBox.style.display = 'none';
+      if (!neonState.selectedPath) {
+        errBox.textContent = 'Choose a model first — Library, Upload, Browse, or Custom Path.';
+        errBox.style.display = 'block';
+        return;
+      }
+
+      bootBtn.disabled = true;
+      bootBtn.textContent = 'Booting…';
+      stageList.style.display = 'block';
+      stageList.innerHTML = '';
+      document.getElementById('engineBadgeText').textContent = 'Booting';
+      document.getElementById('engineBadge').classList.remove('ready');
+
+      const stageRows = {};
+      function upsertStage(name, label) {
+        if (stageRows[name]) return stageRows[name];
+        const row = document.createElement('div');
+        row.className = 'stage-row pending';
+        row.innerHTML = `<span class="stage-icon">●</span><span class="stage-name">${neonEscape(label)}</span><span class="stage-ms"></span>`;
+        stageList.appendChild(row);
+        stageRows[name] = row;
+        return row;
+      }
+
+      try {
+        const resp = await fetch(NEON_RUNTIME_URL + '/api/boot', {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({ model_path: neonState.selectedPath, flags: neonState.flags }),
+        });
+        const reader = resp.body.getReader();
+        const decoder = new TextDecoder();
+        let buffer = '';
+        let success = false;
+
+        while (true) {
+          const { done, value } = await reader.read();
+          if (done) break;
+          buffer += decoder.decode(value, { stream: true });
+          const lines = buffer.split('\n');
+          buffer = lines.pop();
+          for (const line of lines) {
+            if (!line.trim()) continue;
+            const evt = JSON.parse(line);
+            if (evt.type === 'stage_start') {
+              upsertStage(evt.name, evt.label || evt.name);
+            } else if (evt.type === 'stage_end') {
+              const row = upsertStage(evt.name, evt.name);
+              row.classList.remove('pending');
+              row.classList.add(evt.ok ? 'ok' : 'fail');
+              row.querySelector('.stage-icon').textContent = evt.ok ? '✓' : '✕';
+              row.querySelector('.stage-ms').textContent = evt.ms ? `${evt.ms.toFixed(0)}ms` : '';
+              if (evt.detail) {
+                row.classList.add('expandable');
+                const detail = document.createElement('div');
+                detail.className = 'stage-detail';
+                detail.textContent = evt.detail;
+                row.appendChild(detail);
+                row.addEventListener('click', () => row.classList.toggle('expanded'));
+              }
+              neonLog(evt.ok ? 'ok' : 'error', `${evt.name}: ${evt.detail || (evt.ok ? 'ok' : 'failed')}`);
+            } else if (evt.type === 'done') {
+              success = !!evt.ok;
+            }
+          }
+        }
+
+        if (success) {
+          neonState.booted = true;
+          neonState.bootedModelName = neonState.selectedName || neonState.selectedPath;
+          document.getElementById('engineBadgeText').textContent = 'Ready';
+          document.getElementById('engineBadge').classList.add('ready');
+          neonRenderConsoleMeta();
+          neonShowScreen('console');
+          neonLog('ok', 'Runtime booted.');
+        } else {
+          document.getElementById('engineBadgeText').textContent = 'Idle';
+          errBox.textContent = 'Boot failed — see the stage list above for detail.';
+          errBox.style.display = 'block';
+        }
+      } catch (e) {
+        document.getElementById('engineBadgeText').textContent = 'Idle';
+        errBox.textContent = 'Lost connection to the runtime while booting.';
+        errBox.style.display = 'block';
+        neonLog('error', 'Boot stream failed: ' + e.message);
+      } finally {
+        bootBtn.disabled = false;
+        bootBtn.textContent = 'Boot Runtime →';
+      }
+    }
+
+    function neonShowScreen(name) {
+      document.querySelectorAll('#neonApp .screen').forEach(s => s.classList.remove('active'));
+      document.getElementById('screen-' + name).classList.add('active');
+    }
+
+    function neonRebootRuntime() {
+      neonState.booted = false;
+      neonShowScreen('boot');
+    }
+
+    /* -- Console / chat -------------------------------------------------- */
+    function neonRenderConsoleMeta() {
+      const compiler = neonState.flags.USE_ROCM ? 'hipcc (ROCm/HIP)' : 'g++ (CPU)';
+      document.getElementById('consoleMeta').innerHTML = `
+        <div class="meta-item"><span class="meta-k">Model</span><span class="meta-v">${neonEscape(neonState.bootedModelName || '—')}</span></div>
+        <div class="meta-item"><span class="meta-k">Toolchain</span><span class="meta-v">${compiler}</span></div>
+        <button class="btn-ghost btn-sm" onclick="neonRebootRuntime()">Reboot →</button>
+      `;
+    }
+
+    async function neonSendMessage() {
+      const input = document.getElementById('composerInput');
+      const message = input.value.trim();
+      if (!message) return;
+      const asJson = document.getElementById('jsonToggle').checked;
+      input.value = '';
+
+      const transcript = document.getElementById('transcript');
+      const empty = transcript.querySelector('.transcript-empty');
+      if (empty) empty.remove();
+
+      const userMsg = document.createElement('div');
+      userMsg.className = 'msg msg-user';
+      userMsg.innerHTML = `<div class="msg-bubble"><span class="arrow">→</span> ${neonEscape(message)}</div>`;
+      transcript.appendChild(userMsg);
+
+      const pending = document.createElement('div');
+      pending.className = 'msg msg-pending';
+      pending.innerHTML = `<div class="msg-result"><div class="msg-result-body"><span class="pulse-dot"></span> Running…</div></div>`;
+      transcript.appendChild(pending);
+      pending.scrollIntoView({ behavior: 'smooth', block: 'end' });
+
+      try {
+        const resp = await fetch(NEON_RUNTIME_URL + '/api/chat', {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({ message, as_json: asJson }),
+        });
+        const data = await resp.json();
+        pending.remove();
+        const result = document.createElement('div');
+        result.className = 'msg msg-assistant';
+        result.innerHTML = `
+          <div class="msg-result ${data.ok ? '' : 'fail'}">
+            <div class="msg-result-body">${neonEscape(data.stdout || data.stderr || '(no output)')}</div>
+            <div class="msg-result-meta">
+              <span>${data.elapsed_ms ? data.elapsed_ms.toFixed(0) + 'ms' : ''}</span>
+              <span>${(data.returncode !== null && data.returncode !== undefined) ? 'exit ' + data.returncode : ''}</span>
+            </div>
+          </div>`;
+        transcript.appendChild(result);
+        result.scrollIntoView({ behavior: 'smooth', block: 'end' });
+        neonLog(data.ok ? 'ok' : 'error', data.ok ? 'Chat call succeeded.' : (data.stderr || 'Chat call failed.'));
+      } catch (e) {
+        pending.remove();
+        const result = document.createElement('div');
+        result.className = 'msg msg-assistant';
+        result.innerHTML = `<div class="msg-result fail"><div class="msg-result-body">Lost connection to the runtime.</div></div>`;
+        transcript.appendChild(result);
+        neonLog('error', 'Chat call failed: ' + e.message);
+      }
+    }
+
+    neonAttachDropzoneListeners();
+  </script>
+</body>
+</html>
