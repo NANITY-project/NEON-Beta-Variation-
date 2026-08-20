@@ -1,3 +1,9 @@
-NEON: 
-Restrictions: You may not distribute, sub license,host commercially,sell or rebrand this or any modified version under your own name without permission from the author.  
-Grant of Rights: You are permitted to view,download,submit bug report and use the code.
+NEON Runtime License and Terms
+
+Current Prototyping Phase (Beta)
+During the initial beta engineering period, the codebase operates under a restrictive, source-available framework:
+* **Grant of Rights:** Users are permitted to download, locally compile, test, inspect headers, and submit bug reports.
+* **Restrictions:** Commercial hosting, redistribution, sub-licensing, white-labeling, or rebranding of this codebase or its derivatives under a separate name is strictly prohibited without explicit written permission from the author.
+
+### Open-Source Commons Commitment
+The NEON runtime and `.nctr` format specification are specifically engineered to serve as public-benefit digital infrastructure. Upon formal selection,scaling, or independent milestone funding validation, this repository and all foundational architectural assets will permanently transition to a standardized, OSI-approved Free and Open Source Software (FLOSS) framework.
