@@ -117,9 +117,97 @@ from nanity_data_format import (  # noqa: E402
     apply_chat_template,
     crop_preserving_answer,
     is_bin_file,
+    pack_examples,
     read_bin_dataset,
     typecode_for_vocab,
 )
+
+# ---------------------------------------------------------------------------
+# FlashAttention-2/3 forcing -- previously this codebase only avoided passing
+# attn_mask into the model so that SDPA's is_causal heuristic COULD pick a
+# fused flash kernel, with no way to tell whether it actually did. This
+# makes it explicit: force PyTorch's SDPA dispatcher to prefer
+# SDPBackend.FLASH_ATTENTION (falling through to EFFICIENT_ATTENTION, then
+# MATH, only if flash genuinely isn't available for the given shapes/dtype/
+# GPU), and check once at startup so a missing flash kernel on this
+# particular ROCm/PyTorch build is a loud message instead of a silent,
+# permanent slowdown you'd only notice from a lower-than-expected tok/s much
+# later. sdpa_kernel wraps model() calls below and affects every
+# F.scaled_dot_product_attention call inside the model's forward, including
+# ones inside modeling_nanity.py -- no changes needed there.
+# ---------------------------------------------------------------------------
+try:
+    from torch.nn.attention import sdpa_kernel as _sdpa_kernel, SDPBackend as _SDPBackend
+    _SDPA_PRIORITY = [_SDPBackend.FLASH_ATTENTION, _SDPBackend.EFFICIENT_ATTENTION, _SDPBackend.MATH]
+    _HAVE_SDPA_KERNEL = True
+
+    def flash_attention_context():
+        return _sdpa_kernel(_SDPA_PRIORITY)
+except ImportError:
+    import contextlib
+    _HAVE_SDPA_KERNEL = False
+
+    def flash_attention_context():
+        return contextlib.nullcontext()
+
+
+def check_flash_attention(device: str, cfg=None, batch: int = 2, probe_seq_len: int = 2048):
+    """One-time startup diagnostic: actually run an SDPA call with ONLY
+    SDPBackend.FLASH_ATTENTION allowed (no fallback), so a missing/broken
+    flash-attention kernel on this specific ROCm/PyTorch build is caught
+    and reported before burning hours of training at math-fallback speed.
+
+    Probes with THIS model's real n_head/n_kv_head/head_dim (via cfg) and
+    GQA (enable_gqa=True whenever n_group > 1) instead of a generic
+    (4-head, head_dim=64) dummy -- flash-kernel support on ROCm's aotriton
+    backend can be head_dim- and GQA-ratio-specific, so a probe using
+    different shapes than the real model can pass while training still
+    silently falls back to a slower backend. Falls back to a generic probe
+    if cfg isn't available yet (e.g. called before the config is built).
+    """
+    if device != "cuda":
+        print(f"[flash-attn] device={device!r} -- skipping check (only relevant on "
+              f"CUDA/ROCm)")
+        return
+    if not _HAVE_SDPA_KERNEL:
+        print(f"[flash-attn] WARNING: torch.nn.attention.sdpa_kernel isn't available "
+              f"(torch=={torch.__version__} -- need >=2.3) -- can't force a backend "
+              f"preference. Falling back to whatever SDPA's default heuristic picks, "
+              f"same as before this change.")
+        return
+    if cfg is not None:
+        n_head, n_kv_head, head_dim = cfg.n_head, cfg.n_kv_head, cfg.head_dim
+        enable_gqa = cfg.n_group > 1
+        shape_desc = (f"n_head={n_head}, n_kv_head={n_kv_head}, head_dim={head_dim}, "
+                      f"enable_gqa={enable_gqa}, batch={batch}, seq_len={probe_seq_len}")
+    else:
+        n_head = n_kv_head = 4
+        head_dim = 64
+        enable_gqa = False
+        shape_desc = "generic probe (cfg not available yet)"
+    try:
+        q = torch.randn(batch, n_head, probe_seq_len, head_dim, device=device, dtype=torch.bfloat16)
+        k = torch.randn(batch, n_kv_head, probe_seq_len, head_dim, device=device, dtype=torch.bfloat16)
+        v = torch.randn(batch, n_kv_head, probe_seq_len, head_dim, device=device, dtype=torch.bfloat16)
+        with _sdpa_kernel([_SDPBackend.FLASH_ATTENTION]):
+            F.scaled_dot_product_attention(q, k, v, is_causal=True, enable_gqa=enable_gqa)
+        print(f"[flash-attn] OK -- SDPBackend.FLASH_ATTENTION is available on this "
+              f"build (torch=={torch.__version__}) for this model's actual attention "
+              f"shape ({shape_desc}). Forward passes below are wrapped to prefer it "
+              f"over the memory-efficient/math fallbacks.")
+    except Exception as e:
+        print(f"[flash-attn] WARNING: SDPBackend.FLASH_ATTENTION is NOT available for "
+              f"this model's attention shape ({shape_desc}) on this build ({e!r}) -- "
+              f"training will run on SDPBackend.EFFICIENT_ATTENTION instead, which is "
+              f"slower AND (unlike flash) materializes the full [batch, heads, seq, "
+              f"seq] score matrix, so it's the exact memory-bandwidth-bound scenario "
+              f"you're trying to avoid. This usually means the installed ROCm/PyTorch "
+              f"wheel doesn't ship aotriton flash kernels for this head_dim/GQA-ratio "
+              f"combo on this GPU's architecture (gfx942 for MI300X) -- check "
+              f"`python3 -c \"import torch; print(torch.__version__, torch.version.hip)\"` "
+              f"against PyTorch's ROCm release notes, and consider ROCm/flash-attention "
+              f"(https://github.com/ROCm/flash-attention) as a direct alternative if "
+              f"the built-in SDPA dispatcher doesn't cover this shape.")
 
 
 # ---------------------------------------------------------------------------
@@ -659,7 +747,8 @@ def evaluate(model, val_loader, device, max_batches: int) -> dict:
         # independent of the one in the main loop.
         valid = (labels.view(-1) != -100)
         valid_idx = valid.nonzero(as_tuple=True)[0]
-        logits_valid, _ = model(input_ids, select_positions=valid_idx)
+        with flash_attention_context():
+            logits_valid, _ = model(input_ids, select_positions=valid_idx)
         logits_valid = logits_valid.float()
         labels_valid = labels.view(-1).index_select(0, valid_idx)
         answer_sub = answer_mask.view(-1).index_select(0, valid_idx)
@@ -1440,6 +1529,8 @@ def train(args):
                "tiny": NanityConfig.nanity_tiny}[args.preset]()
         print(f"[config] fresh {args.preset} config: {cfg}")
 
+    check_flash_attention(device, cfg=cfg, batch=args.batch)
+
     # ── model ────────────────────────────────────────────────────────────────
     model = NanityForCausalLM(cfg).to(device)
 
@@ -1565,6 +1656,21 @@ def train(args):
     else:
         train_ds, val_ds = split_train_val(ds, args.val_split)
 
+    # ── sequence packing (opt-in via --pack-sequences) ─────────────────────
+    # Runs AFTER the train/val split, on already-tokenized Example objects,
+    # so it's a cheap array-concatenation pass regardless of whether the
+    # underlying data came from a .bin file (the common case now) or JSONL.
+    # Train and val are packed separately/independently -- packing never
+    # lets a val example's tokens end up sharing a row with a train example.
+    if args.pack_sequences:
+        print(f"[pack] packing train set (max_len={max_len}) ...")
+        train_ds.examples = pack_examples(train_ds.examples, max_len,
+                                           pad_id=pad_id, seed=args.seed)
+        if val_ds is not None and len(val_ds) > 0:
+            print(f"[pack] packing val set (max_len={max_len}) ...")
+            val_ds.examples = pack_examples(val_ds.examples, max_len,
+                                             pad_id=pad_id, seed=args.seed)
+
     # BUG FIX (Python 3.14 / any 'forkserver' or 'spawn' start method):
     # `collate_fn=lambda b: collate_fn(b, pad_id=pad_id)` looks harmless but
     # a lambda closing over a local variable is NOT picklable, and
@@ -1591,7 +1697,7 @@ def train(args):
     # torch/transformers in each subprocess) between epochs, and
     # prefetch_factor keeps several batches ready ahead of the GPU instead
     # of just one, so a momentary hiccup in one worker doesn't stall a step.
-    loader_workers = args.tokenize_workers or min(8, (os.cpu_count() or 4))
+    loader_workers = args.tokenize_workers or min(16, (os.cpu_count() or 4))
     loader = torch.utils.data.DataLoader(
         train_ds,
         batch_size=args.batch,
@@ -1863,7 +1969,8 @@ def train(args):
             answer_flat_full = answer_mask.view(-1) & valid_flat
             valid_idx = valid_flat.nonzero(as_tuple=True)[0]
 
-            logits_valid, _ = model(input_ids, select_positions=valid_idx)
+            with flash_attention_context():
+                logits_valid, _ = model(input_ids, select_positions=valid_idx)
             logits_valid = logits_valid.float()
             V = logits_valid.shape[-1]
             labels_valid = labels.view(-1).index_select(0, valid_idx)
@@ -2308,6 +2415,25 @@ def main():
                          "multiprocessing.Pool on some rented cloud "
                          "containers. Lower this if you're tokenizing "
                          "alongside other CPU-heavy work on the same box.")
+
+    # -- sequence packing -----------------------------------------------------
+    tr.add_argument("--pack-sequences", dest="pack_sequences", action="store_true",
+                    help="concatenate examples end-to-end into fixed-length "
+                         "max_len rows instead of separately right-padding "
+                         "each one per batch. Big win when example lengths "
+                         "vary a lot (reasoning-trace SFT data, or the short "
+                         "trailing chunk of each pretrain document) since "
+                         "collate_fn otherwise pads every row in a batch out "
+                         "to its longest member. TRADE-OFF: packed rows are "
+                         "NOT isolated with a block-diagonal attention mask, "
+                         "so a token can attend across the boundary into the "
+                         "previous example packed into the same row -- see "
+                         "pack_examples() in nanity_data_format.py for why "
+                         "(this is what keeps the SDPA is_causal fast path "
+                         "intact). Off by default since it changes the data "
+                         "distribution/step-to-step loss trajectory versus a "
+                         "checkpoint trained without it -- don't flip this on "
+                         "mid-run and expect loss curves to line up.")
 
     # -- vocab freezing (large vocab_size, English-only training data) -------
     tr.add_argument("--freeze-unseen-vocab", dest="freeze_unseen_vocab",
