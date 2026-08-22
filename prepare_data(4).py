@@ -88,7 +88,9 @@ import os
 import random
 import sys
 import time
-from concurrent.futures import ThreadPoolExecutor
+import queue
+import threading
+from concurrent.futures import ThreadPoolExecutor, FIRST_COMPLETED, wait as futures_wait
 from pathlib import Path
 
 from datasets import load_dataset, interleave_datasets
@@ -367,9 +369,17 @@ def pull_pretrain(out_path: Path, tokenizer: FastTokenizer, budget: dict,
     Sources are drawn via weighted-random interleaving (weight = each
     source's remaining budget) so the mix stays representative throughout
     the pull rather than running fully through one source before starting
-    the next. Rows are pulled from the (I/O-bound) streaming iterators one
-    at a time on the main thread, batched, then tokenized+chunked
-    (CPU-bound) across `workers` threads in parallel."""
+    the next.
+
+    PERF: fetching a row (network I/O) and tokenizing+chunking it (CPU) used
+    to happen strictly one after the other on the main thread -- fetch a
+    batch of `workers*4` rows (worker pool idle the whole time), THEN submit
+    them and block until every one is tokenized (network idle the whole
+    time). Total throughput was bounded by fetch_time + tokenize_time
+    instead of max(fetch_time, tokenize_time). Now a dedicated fetcher
+    thread continuously pulls rows into a bounded queue while this thread
+    keeps the CPU pool saturated and drains+writes finished chunks as they
+    complete -- fetch, tokenize, and write all run concurrently."""
     rng = random.Random(seed)
     id_typecode = typecode_for_vocab(len(tokenizer))
     # Role/end control-token ids are the same for every chunk -- encode them
@@ -378,6 +388,7 @@ def pull_pretrain(out_path: Path, tokenizer: FastTokenizer, budget: dict,
     end_ids = tokenizer.encode(END_TOKEN)
     total_written = {k: 0 for k in budget if budget[k] > 0}
     active = set(total_written)  # only sources with budget > 0
+    state_lock = threading.Lock()  # guards total_written/active (read by both threads)
 
     # Only build/touch a source's dataset if it actually has budget -- this
     # is what lets --pretrain-stack 0 fully route around a gated or broken
@@ -413,24 +424,32 @@ def pull_pretrain(out_path: Path, tokenizer: FastTokenizer, budget: dict,
     total_budget = sum(budget[k] for k in active)
     pbar = tqdm(total=total_budget, unit="tok", desc="pretrain mix (all sources)")
     print(f"[pretrain] tokenizing with {workers} worker threads "
-          f"({default_workers()} cores available)")
+          f"({default_workers()} cores available), pipelined fetch/tokenize/write")
 
-    batch_size = max(workers * 4, 1)
+    # Bounded queue decouples the fetcher from the CPU pool: big enough that
+    # the fetcher rarely blocks waiting for room (keeps the network busy),
+    # small enough it can't buffer gigabytes of raw text if tokenization
+    # ever falls behind.
+    row_queue: "queue.Queue" = queue.Queue(maxsize=max(workers * 16, 128))
+    fetch_done = threading.Event()
 
-    writer = BinDatasetWriter(out_path, tokenizer_source=tokenizer_name,
-                               max_len=CHUNK_TOKENS + len(role_ids) + len(end_ids),
-                               vocab_ceiling=len(tokenizer))
-    with writer, ThreadPoolExecutor(max_workers=workers) as ex:
-        while active:
-            batch = []  # (choice, text, source_tag)
-            while len(batch) < batch_size and active:
-                remaining = {k: max(budget[k] - total_written[k], 0) for k in active}
-                names = list(active)
-                weights = [remaining[n] for n in names]
-                if sum(weights) == 0:
-                    active.clear()
-                    break
-                choice = rng.choices(names, weights=weights, k=1)[0]
+    def fetcher():
+        """Runs in its own thread for the life of the pull. Pure I/O
+        (next() on a streaming HF iterator) plus the cheap weighted-choice
+        bookkeeping -- never touches the CPU-bound tokenize step, so it can
+        keep issuing network requests the whole time the pool is busy."""
+        try:
+            while True:
+                with state_lock:
+                    if not active:
+                        return
+                    remaining = {k: max(budget[k] - total_written[k], 0) for k in active}
+                    names = list(active)
+                    weights = [remaining[n] for n in names]
+                    if sum(weights) == 0:
+                        active.clear()
+                        return
+                    choice = rng.choices(names, weights=weights, k=1)[0]
                 it, source_tag, field = sources[choice]
                 try:
                     row = next(it)
@@ -438,7 +457,8 @@ def pull_pretrain(out_path: Path, tokenizer: FastTokenizer, budget: dict,
                     print(f"[{source_tag}] source exhausted at "
                           f"{total_written[choice]:,} tokens (target was "
                           f"{budget[choice]:,}) -- dropping from the mix")
-                    active.discard(choice)
+                    with state_lock:
+                        active.discard(choice)
                     continue
                 except Exception as e:
                     # A dead streaming iterator (e.g. a corrupted/truncated
@@ -453,28 +473,65 @@ def pull_pretrain(out_path: Path, tokenizer: FastTokenizer, budget: dict,
                           f"{budget[choice]:,}): {type(e).__name__}: {e} "
                           f"-- dropping this source from the mix, "
                           f"continuing with the rest")
-                    active.discard(choice)
+                    with state_lock:
+                        active.discard(choice)
                     continue
-                batch.append((choice, row[field], source_tag))
-                if total_written[choice] >= budget[choice]:
-                    # already at/over budget from a previous batch; stop
-                    # drawing more from it once this row is accounted for
-                    active.discard(choice)
+                row_queue.put((choice, row[field], source_tag))  # blocks if queue is full
+        finally:
+            fetch_done.set()
 
-            if not batch:
-                break
+    fetch_thread = threading.Thread(target=fetcher, daemon=True, name="pretrain-fetcher")
+    fetch_thread.start()
 
-            futures = [ex.submit(tokenize_and_chunk, tokenizer, text,
-                                  role_ids, end_ids, id_typecode)
-                       for (_choice, text, _tag) in batch]
-            for (choice, _text, _tag), fut in zip(batch, futures):
+    writer = BinDatasetWriter(out_path, tokenizer_source=tokenizer_name,
+                               max_len=CHUNK_TOKENS + len(role_ids) + len(end_ids),
+                               vocab_ceiling=len(tokenizer))
+    max_in_flight = workers * 3  # keep the pool fed without unbounded memory growth
+    with writer, ThreadPoolExecutor(max_workers=workers) as ex:
+        in_flight: dict = {}
+        while True:
+            # Submit whatever's queued right now, up to the in-flight cap,
+            # without ever blocking the pool waiting on a single fetch.
+            while len(in_flight) < max_in_flight:
+                try:
+                    choice, text, _tag = row_queue.get_nowait()
+                except queue.Empty:
+                    break
+                fut = ex.submit(tokenize_and_chunk, tokenizer, text,
+                                 role_ids, end_ids, id_typecode)
+                in_flight[fut] = choice
+
+            if not in_flight:
+                if fetch_done.is_set() and row_queue.empty():
+                    break
+                # Fetcher hasn't produced anything yet (e.g. cold start /
+                # momentarily slow network) -- wait briefly rather than
+                # busy-spinning.
+                try:
+                    choice, text, _tag = row_queue.get(timeout=0.5)
+                except queue.Empty:
+                    continue
+                fut = ex.submit(tokenize_and_chunk, tokenizer, text,
+                                 role_ids, end_ids, id_typecode)
+                in_flight[fut] = choice
+                continue
+
+            done, _pending = futures_wait(list(in_flight.keys()), timeout=0.5,
+                                           return_when=FIRST_COMPLETED)
+            for fut in done:
+                choice = in_flight.pop(fut)
                 for example, n_tok in fut.result():
                     writer.add_example(example)
-                    total_written[choice] += n_tok
                     pbar.update(n_tok)
-                if total_written[choice] >= budget[choice]:
-                    active.discard(choice)
+                    with state_lock:
+                        total_written[choice] += n_tok
+                        if total_written[choice] >= budget[choice]:
+                            active.discard(choice)
 
+            if fetch_done.is_set() and row_queue.empty() and not in_flight:
+                break
+
+    fetch_thread.join(timeout=2)
     pbar.close()
 
     print(f"[pretrain] wrote {writer.n_written:,} examples -> {out_path}")
@@ -510,9 +567,44 @@ def _tokenize_and_write(writer: BinDatasetWriter, tokenizer: FastTokenizer,
     counters[tag][0] += 1
 
 
+def _parallel_tokenize_write(rows: list, extract_messages, tokenizer: FastTokenizer,
+                              max_len: int, id_typecode: str, think_end_markers,
+                              writer: BinDatasetWriter, tag: str, counters: dict,
+                              workers: int, desc: str):
+    """Same shape as _tokenize_and_write, but spreads the CPU-bound
+    normalize+tokenize+crop step across `workers` threads via
+    ThreadPoolExecutor.map (the fast tokenizer releases the GIL during
+    encode(), same reasoning as the pretrain path) instead of a plain
+    single-threaded `for row in tqdm(rows)` loop, which never used more
+    than one core no matter how many were available.
+
+    writer.add_example() is NOT thread-safe (it's a plain buffered file
+    handle), so all writes stay on this thread -- .map() preserves input
+    order and yields results as the pool finishes them, so this thread's
+    only job is to write each completed result out as it arrives.
+    """
+    def _work(row):
+        messages = extract_messages(row)
+        normed = normalize_messages(messages)
+        if not normed:
+            return None
+        ex, status = tokenize_conversation(normed, tokenizer, max_len, id_typecode,
+                                            think_end_markers)
+        return ex if status == "ok" else None
+
+    with ThreadPoolExecutor(max_workers=workers) as ex_pool:
+        for result in tqdm(ex_pool.map(_work, rows),
+                            total=len(rows), desc=desc):
+            if result is None:
+                counters[tag][1] += 1
+            else:
+                writer.add_example(result)
+                counters[tag][0] += 1
+
+
 def pull_openthoughts3(writer: BinDatasetWriter, tokenizer: FastTokenizer,
                         max_len: int, id_typecode: str, think_end_markers,
-                        n_target: int, seed: int):
+                        n_target: int, seed: int, workers: int):
     """850k math / 250k code / 100k science in the source. Subsample
     proportionally so the 600k target keeps the same domain mix rather than
     just taking the first 600k rows (which would be arbitrarily domain-
@@ -524,14 +616,16 @@ def pull_openthoughts3(writer: BinDatasetWriter, tokenizer: FastTokenizer,
         by_domain.setdefault(row["domain"], []).append(row)
     rng = random.Random(seed)
     total_src = sum(len(v) for v in by_domain.values())
-    counters = {"openthoughts3": [0, 0]}
+    selected = []
     for domain, rows in by_domain.items():
         take = int(n_target * len(rows) / total_src)
         rng.shuffle(rows)
-        for row in tqdm(rows[:take], desc=f"[openthoughts3:{domain}]", leave=False):
-            _tokenize_and_write(writer, tokenizer, max_len, id_typecode,
-                                 think_end_markers, row["conversations"],  # already from/value
-                                 "openthoughts3", counters)
+        selected.extend(rows[:take])
+    counters = {"openthoughts3": [0, 0]}
+    _parallel_tokenize_write(
+        selected, lambda row: row["conversations"],  # already from/value
+        tokenizer, max_len, id_typecode, think_end_markers,
+        writer, "openthoughts3", counters, workers, desc="[openthoughts3]")
     written, skipped = counters["openthoughts3"]
     print(f"[openthoughts3] wrote {written:,} examples ({skipped:,} skipped/overflow) "
           f"-> {writer.path}")
@@ -539,7 +633,7 @@ def pull_openthoughts3(writer: BinDatasetWriter, tokenizer: FastTokenizer,
 
 def pull_opencodereasoning(writer: BinDatasetWriter, tokenizer: FastTokenizer,
                             max_len: int, id_typecode: str, think_end_markers,
-                            n_target: int, seed: int):
+                            n_target: int, seed: int, workers: int):
     print(f"[opencodereasoning] target {n_target:,} examples")
     # NOTE: the "split_0" config's only available split is also literally
     # named "split_0" (not "train") -- load_dataset(..., split="train")
@@ -548,9 +642,13 @@ def pull_opencodereasoning(writer: BinDatasetWriter, tokenizer: FastTokenizer,
     idx = list(range(len(ds)))
     random.Random(seed).shuffle(idx)
     idx = idx[:n_target]
+    # Materialize rows up front (ds[i] random access) so the thread pool
+    # below is doing pure tokenize+crop CPU work, not fighting each other
+    # over dataset-library random-access locks interleaved with encode().
+    rows = [ds[i] for i in tqdm(idx, desc="[opencodereasoning:read]")]
     counters = {"opencodereasoning": [0, 0]}
-    for i in tqdm(idx, desc="[opencodereasoning]"):
-        row = ds[i]
+
+    def _extract(row):
         # 'output' is R1's full response, reasoning trace included -- this
         # already contains the model's own <think>-style markers from R1's
         # generation, which the default --think-end-markers list should
@@ -558,32 +656,34 @@ def pull_opencodereasoning(writer: BinDatasetWriter, tokenizer: FastTokenizer,
         # <|end_of_thought|> / <|begin_of_solution|>, the whole response
         # falls back to counting as "answer" (safe default -- see
         # apply_chat_template's split_think_answer).
-        messages = [
+        return [
             {"role": "user", "content": row["input"]},
             {"role": "assistant", "content": row["output"]},
         ]
-        _tokenize_and_write(writer, tokenizer, max_len, id_typecode,
-                             think_end_markers, messages,
-                             "opencodereasoning", counters)
+
+    _parallel_tokenize_write(
+        rows, _extract, tokenizer, max_len, id_typecode, think_end_markers,
+        writer, "opencodereasoning", counters, workers, desc="[opencodereasoning]")
     written, skipped = counters["opencodereasoning"]
     print(f"[opencodereasoning] wrote {written:,} examples ({skipped:,} skipped/overflow) "
           f"-> {writer.path}")
 
 
 def pull_bespoke_stratos(writer: BinDatasetWriter, tokenizer: FastTokenizer,
-                          max_len: int, id_typecode: str, think_end_markers):
+                          max_len: int, id_typecode: str, think_end_markers,
+                          workers: int):
     print("[bespoke-stratos-17k] pulling full set (17k)")
     ds = load_dataset("bespokelabs/Bespoke-Stratos-17k", split="train")
     counters = {"bespoke-stratos-17k": [0, 0]}
-    for row in tqdm(ds, desc="[bespoke-stratos-17k]"):
-        # NOTE: same lineage/tooling as OpenThoughts (Bespoke Curator),
-        # expected to carry a "conversations" field in from/value form.
-        # If this dataset's schema has since changed, this will KeyError
-        # loudly rather than silently writing garbage -- check the dataset
-        # viewer on HF if so and adjust the field name below.
-        _tokenize_and_write(writer, tokenizer, max_len, id_typecode,
-                             think_end_markers, row["conversations"],
-                             "bespoke-stratos-17k", counters)
+    # NOTE: same lineage/tooling as OpenThoughts (Bespoke Curator), expected
+    # to carry a "conversations" field in from/value form. If this dataset's
+    # schema has since changed, this will KeyError loudly (inside a worker
+    # thread, surfaced via .map()) rather than silently writing garbage --
+    # check the dataset viewer on HF if so and adjust the field name below.
+    _parallel_tokenize_write(
+        list(ds), lambda row: row["conversations"],
+        tokenizer, max_len, id_typecode, think_end_markers,
+        writer, "bespoke-stratos-17k", counters, workers, desc="[bespoke-stratos-17k]")
     written, skipped = counters["bespoke-stratos-17k"]
     print(f"[bespoke-stratos-17k] wrote {written:,} examples ({skipped:,} skipped/overflow) "
           f"-> {writer.path}")
@@ -682,10 +782,12 @@ def main():
         with sft_writer:
             if not args.skip_sft_openthoughts3:
                 pull_openthoughts3(sft_writer, tokenizer, args.max_len, id_typecode,
-                                    think_end_markers, args.sft_openthoughts3, args.seed)
+                                    think_end_markers, args.sft_openthoughts3, args.seed,
+                                    workers)
             if not args.skip_sft_opencodereasoning:
                 pull_opencodereasoning(sft_writer, tokenizer, args.max_len, id_typecode,
-                                        think_end_markers, args.sft_opencodereasoning, args.seed)
+                                        think_end_markers, args.sft_opencodereasoning, args.seed,
+                                        workers)
 
         # Kept as its OWN file, not merged into sft_reasoning.bin -- this is
         # meant as a small, separate final-polish pass (low LR, 2-3 epochs)
@@ -699,7 +801,7 @@ def main():
                                               think_end_markers=think_end_markers)
             with polish_writer:
                 pull_bespoke_stratos(polish_writer, tokenizer, args.max_len, id_typecode,
-                                      think_end_markers)
+                                      think_end_markers, workers)
 
     print("\n[done] files written to", out_dir)
     print("  pretrain_mix.bin  -> --phase warmup")
