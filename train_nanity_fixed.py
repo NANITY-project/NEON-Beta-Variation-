@@ -93,6 +93,7 @@ from typing import Iterator, Optional
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
+import numpy as np
 
 # ---------------------------------------------------------------------------
 # Inline modeling_nanity -- import from the same directory, falling back to
@@ -629,10 +630,14 @@ def evaluate(model, val_loader, device, max_batches: int) -> dict:
     for i, (input_ids, labels, attn_mask, answer_mask) in enumerate(val_loader):
         if i >= max_batches:
             break
-        input_ids   = input_ids.to(device)
-        labels      = labels.to(device)
-        attn_mask   = attn_mask.to(device)
-        answer_mask = answer_mask.to(device)
+        # PERF FIX: non_blocking=True lets these four H2D copies overlap
+        # with host-side work instead of each one blocking the calling
+        # thread -- safe here specifically because val_loader has
+        # pin_memory=True, so the source tensors are already page-locked.
+        input_ids   = input_ids.to(device, non_blocking=True)
+        labels      = labels.to(device, non_blocking=True)
+        attn_mask   = attn_mask.to(device, non_blocking=True)
+        answer_mask = answer_mask.to(device, non_blocking=True)
         # PERF FIX: do NOT pass attention_mask here. This is right-padded
         # causal LM data -- a real token at position i only ever attends
         # backward to positions 0..i, which are always real content (pad
@@ -702,22 +707,56 @@ def compute_used_vocab_mask(datasets: list, vocab_size: int, tokenizer=None) -> 
     return used
 
 
+_ARRAY_TYPECODE_TO_NP = {"H": np.uint16, "I": np.uint32, "B": np.uint8}
+
+
 def collate_fn(batch, pad_id: int = 0):
-    """Right-pad to the longest sequence in the batch."""
+    """Right-pad to the longest sequence in the batch.
+
+    PERF FIX: this used to loop over every token in every example in plain
+    Python (`for j, is_loss in enumerate(msk): ...`) to build labels/
+    answer_mask, plus `torch.tensor(ids, ...)` on a raw array.array, which
+    iterates it element-by-element rather than using the buffer protocol.
+    For long reasoning-trace sequences (up to 8k tokens) at even a modest
+    batch size, that's tens of thousands of Python-level operations PER
+    BATCH, called every single training step -- on a rented cloud box with
+    modest per-core speed, this is exactly the kind of CPU-side collation
+    cost that can cap end-to-end tokens/sec well below what the GPU could
+    otherwise sustain, especially with only a couple of DataLoader workers.
+
+    Fix: array.array -> numpy via the buffer protocol (zero-copy) ->
+    torch (zero-copy from numpy) -> vectorized dtype casts and boolean
+    ops. No per-token Python-level loop anywhere in this function now.
+    """
     ids_list, mask_list, is_answer_list = zip(*batch)
-    max_len = max(len(x) for x in ids_list)
-    input_ids    = torch.full((len(ids_list), max_len), pad_id, dtype=torch.long)
-    labels       = torch.full((len(ids_list), max_len), -100,   dtype=torch.long)
-    attn_mask    = torch.zeros(len(ids_list), max_len,           dtype=torch.bool)
-    answer_mask  = torch.zeros(len(ids_list), max_len,           dtype=torch.bool)
-    for i, (ids, msk, is_ans) in enumerate(zip(ids_list, mask_list, is_answer_list)):
-        n = len(ids)
-        input_ids[i, :n]  = torch.tensor(ids, dtype=torch.long)
-        attn_mask[i, :n]  = True
-        for j, is_loss in enumerate(msk):
-            if is_loss:
-                labels[i, j] = ids[j]
-                answer_mask[i, j] = is_ans[j]
+    lengths = [len(x) for x in ids_list]
+    max_len = max(lengths)
+    bsz = len(ids_list)
+
+    input_ids   = torch.full((bsz, max_len), pad_id, dtype=torch.long)
+    labels      = torch.full((bsz, max_len), -100,   dtype=torch.long)
+    attn_mask   = torch.zeros((bsz, max_len), dtype=torch.bool)
+    answer_mask = torch.zeros((bsz, max_len), dtype=torch.bool)
+
+    for i, (ids, msk, is_ans, n) in enumerate(zip(ids_list, mask_list, is_answer_list, lengths)):
+        # np.frombuffer shares memory with the array.array (no copy); the
+        # subsequent torch.from_numpy also shares memory with that numpy
+        # view. Only the final dtype upcast (.long()/.bool()) actually
+        # copies, and that's a single vectorized C-level op instead of a
+        # Python loop.
+        ids_np = np.frombuffer(ids, dtype=_ARRAY_TYPECODE_TO_NP[ids.typecode])
+        msk_np = np.frombuffer(msk, dtype=np.uint8)
+        ans_np = np.frombuffer(is_ans, dtype=np.uint8)
+
+        ids_t = torch.from_numpy(ids_np).long()
+        msk_t = torch.from_numpy(msk_np).bool()
+        ans_t = torch.from_numpy(ans_np).bool()
+
+        input_ids[i, :n]   = ids_t
+        attn_mask[i, :n]   = True
+        labels[i, :n]      = torch.where(msk_t, ids_t, torch.full_like(ids_t, -100))
+        answer_mask[i, :n] = ans_t & msk_t
+
     return input_ids, labels, attn_mask, answer_mask
 
 
@@ -1341,6 +1380,18 @@ def train(args):
         print(f"[hw] GPU: {gpu_name}  (torch={torch.__version__}, "
               f"rocm/hip={hip_version or 'n/a'})")
         is_mi300x = "MI300X" in gpu_name or "MI300" in gpu_name
+        # PERF: cudnn.benchmark lets cuDNN/MIOpen autotune and cache the
+        # fastest conv/GEMM algorithm per distinct input shape it sees
+        # instead of always using a generic default -- a real win once
+        # shapes settle down, even with variable seq_len (collate_fn only
+        # produces a handful of distinct (batch, padded_len) shapes per
+        # dataset in practice, not a new one every step). allow_tf32
+        # affects FP32 matmuls only; harmless here since training runs in
+        # BF16, but costs nothing to set for any FP32 path (teacher model,
+        # loss computation) that isn't explicitly BF16.
+        torch.backends.cudnn.benchmark = True
+        torch.backends.cuda.matmul.allow_tf32 = True
+        torch.backends.cudnn.allow_tf32 = True
         if os.environ.get("PYTORCH_HIP_ALLOC_CONF") is None and \
            os.environ.get("PYTORCH_CUDA_ALLOC_CONF") is None:
             print("[hw] tip: if you see OOM after many steps despite a stable "
@@ -1467,13 +1518,23 @@ def train(args):
     # Content-hashed here, once, rather than at export time -- export_nctr()
     # might run long after the data file has moved/changed, so the hash
     # needs to be captured while we know it's the actual file that was used.
+    # PERF/MEMORY FIX: this used to be open(...).read() -- for a multi-GB
+    # .bin pretrain file, that's the whole file loaded into RAM just to hash
+    # it, on top of whatever ConversationDataset already holds. Hash in
+    # fixed-size chunks instead: identical digest, O(1) memory regardless
+    # of file size.
+    def _sha256_file(p: str, chunk_size: int = 1 << 20) -> str:
+        h = hashlib.sha256()
+        with open(p, "rb") as _fh:
+            for chunk in iter(lambda: _fh.read(chunk_size), b""):
+                h.update(chunk)
+        return h.hexdigest()
+
     import hashlib
-    with open(args.data, "rb") as _f:
-        data_hash = hashlib.sha256(_f.read()).hexdigest()
+    data_hash = _sha256_file(args.data)
     resumed_hash = None
     if args.resume and os.path.isfile(args.resume):
-        with open(args.resume, "rb") as _f:
-            resumed_hash = hashlib.sha256(_f.read()).hexdigest()
+        resumed_hash = _sha256_file(args.resume)
 
     train_meta = {
         "data_path": args.data,
@@ -1521,23 +1582,38 @@ def train(args):
     # matter what Python version or OS this runs under.
     collate = functools.partial(collate_fn, pad_id=pad_id)
 
+    # PERF: worker count now scales with available cores (same affinity-
+    # aware count already used for tokenization) instead of a hardcoded
+    # 4/2. collate_fn is fully vectorized now (see above) so each worker's
+    # per-batch cost is tiny, but more workers still means deeper prefetch
+    # depth and better overlap with the GPU step. persistent_workers avoids
+    # tearing down and respawning the whole worker pool (re-importing
+    # torch/transformers in each subprocess) between epochs, and
+    # prefetch_factor keeps several batches ready ahead of the GPU instead
+    # of just one, so a momentary hiccup in one worker doesn't stall a step.
+    loader_workers = args.tokenize_workers or min(8, (os.cpu_count() or 4))
     loader = torch.utils.data.DataLoader(
         train_ds,
         batch_size=args.batch,
         shuffle=True,
-        num_workers=4,
+        num_workers=loader_workers,
         pin_memory=(device == "cuda"),
+        persistent_workers=(loader_workers > 0),
+        prefetch_factor=(4 if loader_workers > 0 else None),
         collate_fn=collate,
         drop_last=True,
     )
     val_loader = None
     if val_ds is not None and len(val_ds) > 0:
+        val_loader_workers = max(1, loader_workers // 2)
         val_loader = torch.utils.data.DataLoader(
             val_ds,
             batch_size=args.batch,
             shuffle=False,
-            num_workers=2,
+            num_workers=val_loader_workers,
             pin_memory=(device == "cuda"),
+            persistent_workers=(val_loader_workers > 0),
+            prefetch_factor=(4 if val_loader_workers > 0 else None),
             collate_fn=collate,
             drop_last=False,
         )
@@ -1728,7 +1804,7 @@ def train(args):
     best_ckpt_step    = start_step
     lr                = args.lr
 
-    optimizer.zero_grad()
+    optimizer.zero_grad(set_to_none=True)
 
     def data_iter() -> Iterator:
         while True:
@@ -1742,10 +1818,13 @@ def train(args):
         if step >= start_step + args.steps:
             break
 
-        input_ids   = input_ids.to(device)
-        labels      = labels.to(device)
-        attn_mask   = attn_mask.to(device)
-        answer_mask = answer_mask.to(device)
+        # PERF FIX: non_blocking=True (safe with loader's pin_memory=True)
+        # -- these copies can overlap with the tail of the previous step's
+        # CPU-side bookkeeping instead of each blocking in turn.
+        input_ids   = input_ids.to(device, non_blocking=True)
+        labels      = labels.to(device, non_blocking=True)
+        attn_mask   = attn_mask.to(device, non_blocking=True)
+        answer_mask = answer_mask.to(device, non_blocking=True)
 
         # BUG FIX: forward+backward had no OOM handling at all -- any
         # transient memory spike (a batch with unusually long sequences
@@ -1916,7 +1995,11 @@ def train(args):
             for pg in optimizer.param_groups:
                 pg["lr"] = lr
             optimizer.step()
-            optimizer.zero_grad()
+            # PERF: set_to_none=True skips the memset that zeroing every
+            # gradient tensor in place requires -- next backward() just
+            # allocates fresh grad tensors instead. Cheap, and consistent
+            # with the other zero_grad() calls in this function now.
+            optimizer.zero_grad(set_to_none=True)
 
         step += 1
 
