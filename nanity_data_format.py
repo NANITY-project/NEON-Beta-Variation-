@@ -262,7 +262,7 @@ class BinDatasetWriter:
             except Exception:
                 existing = None
             if existing == header:
-                self._f: BinaryIO = open(self.path, "ab")
+                self._f: BinaryIO = open(self.path, "ab", buffering=1 << 23)
                 self.n_written = 0
                 return
             elif existing is not None:
@@ -272,7 +272,13 @@ class BinDatasetWriter:
                       f"(existing: {existing}, this run: {header})")
 
         header_bytes = json.dumps(header).encode("utf-8")
-        self._f = open(self.path, "wb")
+        # PERF: 8MB buffer instead of the platform default (~8-64KB) --
+        # at pretrain scale (millions of small add_example() calls) the
+        # default buffer flushes to a write() syscall roughly every other
+        # record; an 8MB buffer collapses that to one syscall per few
+        # thousand records, which matters when a single fetch+tokenize
+        # pipeline is trying to sustain hundreds of thousands of tokens/sec.
+        self._f = open(self.path, "wb", buffering=1 << 23)
         self._f.write(MAGIC)
         self._f.write(struct.pack(_HEADER_LEN_FMT, len(header_bytes)))
         self._f.write(header_bytes)
@@ -290,10 +296,18 @@ class BinDatasetWriter:
         if sys.byteorder != "little":
             ids = array.array(ids.typecode, ids)
             ids.byteswap()
-        self._f.write(struct.pack(_RECORD_LEN_FMT, n))
-        self._f.write(ids.tobytes())
-        self._f.write(bytes(bytearray(mask)))
-        self._f.write(bytes(bytearray(is_answer)))
+        # PERF: one write() call per record instead of four. mask/is_answer
+        # are already 'B'-typecode array.array objects in every caller, so
+        # .tobytes() is a direct memoryview cast (no bytearray copy-then-
+        # rewrap); concatenating into a single bytes object before the write
+        # trades one extra allocation for three fewer Python/syscall-level
+        # write() dispatches per record -- a real win at millions of records.
+        self._f.write(
+            struct.pack(_RECORD_LEN_FMT, n)
+            + ids.tobytes()
+            + mask.tobytes()
+            + is_answer.tobytes()
+        )
         self.n_written += 1
 
     def close(self):
