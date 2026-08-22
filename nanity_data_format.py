@@ -1,2487 +1,540 @@
 #!/usr/bin/env python3
 """
-train_nanity.py — full training pipeline for NANITY 4B on AMD MI300X.
+nanity_data_format.py -- shared conversation-tokenization + binary dataset
+format for NANITY, imported by BOTH prepare_data.py (writer) and
+train_nanity_fixed.py (reader/trainer).
 
-Three sequential phases, each optional and independently resumable:
-  Phase 1 [WARMUP]   — short general-text pre-training to stabilize the
-                        embedding space before distillation. Skip if you
-                        want pure distillation from random init (riskier
-                        but faster to start).
-  Phase 2 [DISTILL]  — KL-divergence distillation from a teacher model
-                        (e.g. DeepSeek-R1-70B loaded on the same MI300X
-                        in 4-bit, or from pre-generated offline logits).
-  Phase 3 [FINETUNE] — standard CE fine-tuning on your own curated data
-                        (identity, tool use, CoT format, human-like tone).
+Why this file exists:
+  prepare_data.py used to write plain-text JSONL, and train_nanity_fixed.py
+  tokenized it (apply_chat_template + crop_preserving_answer) the first time
+  it was ever trained on, then cached the result as a pickle keyed on
+  (tokenizer, max_len, think_end_markers, file size/mtime). That meant the
+  FIRST run against any new data file always paid the full tokenization
+  cost, and prepare_data.py's own pretrain tokenization pass (done just to
+  chunk long docs to CHUNK_TOKENS) was thrown away and redone from scratch
+  by the trainer.
 
-MI300X-specific setup (run ONCE before training):
-  pip install torch torchvision torchaudio --index-url https://download.pytorch.org/whl/rocm6.2
-  pip install transformers accelerate gguf sentencepiece
+  Now prepare_data.py does the real tokenization ONCE, up front, using the
+  exact same apply_chat_template()/crop_preserving_answer() the trainer
+  uses (imported from here, not reimplemented), and writes the resulting
+  (ids, mask, is_answer) arrays straight to a .bin file. train_nanity_fixed.py
+  reads that .bin directly into Example objects -- no JSON parsing, no
+  chat-template application, no cropping, no separate pickle cache (the
+  .bin file already IS the cache).
 
-Usage:
-  # Phase 2 distillation (most common starting point):
-  python3 train_nanity.py \
-      --phase distill \
-      --data    data/distill.bin \
-      --teacher microsoft/Phi-4-mini-instruct \   # or path to DeepSeek-R1-70B
-      --out     checkpoints/nanity_4b \
-      --steps   50000 \
-      --batch   4 \
-      --grad-accum 8
+  Keeping apply_chat_template/crop_preserving_answer/Example defined ONCE,
+  here, instead of duplicated in both scripts, is what guarantees a .bin
+  file written by prepare_data.py tokenizes identically to what the old
+  JSONL-at-train-time path would have produced -- a silent drift between
+  two copies of this logic would be far worse than either script being
+  slow, since it would corrupt training data without any error.
 
-  # Phase 3 fine-tune from a distillation checkpoint:
-  python3 train_nanity.py \
-      --phase   finetune \
-      --data    data/finetune.bin \
-      --resume  checkpoints/nanity_4b/ckpt_050000.pt \
-      --out     checkpoints/nanity_4b_ft \
-      --steps   5000
+.bin file layout:
+  8s   magic       b"NANTYBN1"
+  I    header_len  (uint32, little-endian)
+  ...  header      header_len bytes of UTF-8 JSON:
+         {
+           "tokenizer_source": str,      # must match --tokenizer at train time
+           "max_len": int,               # max_len examples were cropped to
+           "think_end_markers": [str],   # markers used for the think/answer split
+           "id_typecode": "H" | "I",     # array.array typecode for ids
+           "vocab_ceiling": int,         # len(tokenizer) at write time
+         }
+  then records back-to-back until EOF, each:
+    I              n_tokens (uint32 LE)
+    n_tokens * w   ids       (w = 2 bytes if id_typecode=='H' else 4, LE)
+    n_tokens       mask       (1 byte each, 0/1)
+    n_tokens       is_answer  (1 byte each, 0/1)
 
-  # Export final checkpoint to GGUF:
-  python3 train_nanity.py \
-      --export  checkpoints/nanity_4b_ft/ckpt_005000.pt \
-      --gguf    nanity_4b_trained.gguf
-
-Data format:
-  Preferred: a pre-tokenized .bin file written by prepare_data.py (see
-  nanity_data_format.py) -- ConversationDataset loads these directly with
-  NO tokenization at train time, since prepare_data.py already ran
-  apply_chat_template()/crop_preserving_answer() and packed the resulting
-  (ids, mask, is_answer) arrays to disk. This is the fast path and what
-  prepare_data.py now produces by default.
-
-  Also still supported: JSONL, one conversation per line --
-  {"messages": [
-      {"role": "system",    "content": "You are NANITY..."},
-      {"role": "user",      "content": "Hello"},
-      {"role": "assistant", "content": "Hi! How can I help?"}
-  ]}
-  -- tokenized (and pickle-cached next to the file) the first time
-  ConversationDataset loads it. Use this only for data that didn't go
-  through prepare_data.py.
-
-  Either way, the loss is computed ONLY on assistant turns (response
-  tokens), never on the prompt. System/user tokens are included in the
-  context but masked out of the loss, matching standard instruction-tuning
-  practice.
+No trailing count/footer -- readers stream until EOF. That means writing is
+a single forward pass (works fine both for a live HF-streaming pull and for
+a multi-GB pretrain corpus) and a crashed/truncated write just yields fewer
+examples on read rather than a corrupt file structure.
 """
-
 from __future__ import annotations
 
-import argparse
 import array
-import functools
-import itertools
-import hashlib
 import json
-import pickle
+import mmap
 import random
-import math
-import os
-from concurrent.futures import ThreadPoolExecutor, as_completed
-
-# Fast (Rust-backed) tokenizers use their own internal thread pool per call.
-# This is now the only source of tokenization speedup (no Python-level
-# multiprocessing -- see ConversationDataset for why that was reverted on
-# resource-constrained cloud containers), so it stays enabled.
-os.environ.setdefault("TOKENIZERS_PARALLELISM", "true")
-
+import struct
 import sys
-import time
+from dataclasses import dataclass
 from pathlib import Path
-from typing import Iterator, Optional
+from typing import BinaryIO, Optional
 
-import torch
-import torch.nn as nn
-import torch.nn.functional as F
-import numpy as np
+MAGIC = b"NANTYBN1"
+_HEADER_LEN_FMT = "<I"
+_RECORD_LEN_FMT = "<I"
+
+# Default think/answer split markers -- covers the OpenThoughts /
+# Bespoke-Stratos / Sky-T1 family convention as well as plain
+# <think>...</think>. Kept here (not just in the trainer) so prepare_data.py
+# uses the identical default when the caller doesn't override it.
+DEFAULT_THINK_END_MARKERS = ["<|begin_of_solution|>", "</think>", "<|end_of_thought|>"]
+
+ROLE_TOKEN = {
+    "system":    "<|system|>",
+    "user":      "<|user|>",
+    "assistant": "<|assistant|>",
+}
+END_TOKEN = "<|end|>"
+
 
 # ---------------------------------------------------------------------------
-# Inline modeling_nanity -- import from the same directory, falling back to
-# a sibling path that matches the NANITY project layout.
+# In-memory example representation (array.array-packed -- see the docstring
+# in the original trainer for why: plain list[int]/list[bool] cost ~28 bytes
+# of Python object overhead PER TOKEN, which OOM'd a 5M-line tokenization
+# pass; array.array stores a real packed C buffer instead).
 # ---------------------------------------------------------------------------
-_here = Path(__file__).parent
-for _candidate in [_here, _here.parent, _here / "NEON R2"]:
-    if (_candidate / "modeling_nanity.py").exists():
-        sys.path.insert(0, str(_candidate))
-        break
 
-from modeling_nanity import NanityConfig, NanityForCausalLM  # noqa: E402
+@dataclass
+class Example:
+    ids:       "array.array"   # typecode 'H' (vocab <= 65536) or 'I'
+    mask:      "array.array"   # typecode 'B' -- 1 where loss is computed
+    is_answer: "array.array"   # typecode 'B' -- 1 for final-answer tokens
 
-# nanity_data_format.py is the SHARED source of truth for apply_chat_template /
-# crop_preserving_answer / Example / the .bin dataset format -- prepare_data.py
-# imports the exact same module so a .bin file it writes always tokenizes
-# identically to what this trainer would have produced from JSONL. Do not
-# reimplement any of these here; import them.
-from nanity_data_format import (  # noqa: E402
-    Example,
-    apply_chat_template,
-    crop_preserving_answer,
-    is_bin_file,
-    pack_examples,
-    read_bin_dataset,
-    typecode_for_vocab,
-)
+
+def typecode_for_vocab(vocab_ceiling: int) -> str:
+    """'H' (unsigned short, 2 bytes) covers any vocab up to 65536; larger
+    vocabs (e.g. a 200064-token tokenizer) need 'I' (4 bytes) or ids would
+    silently wrap and corrupt token ids above 65535."""
+    return "H" if vocab_ceiling <= 0xFFFF else "I"
+
 
 # ---------------------------------------------------------------------------
-# FlashAttention-2/3 forcing -- previously this codebase only avoided passing
-# attn_mask into the model so that SDPA's is_causal heuristic COULD pick a
-# fused flash kernel, with no way to tell whether it actually did. This
-# makes it explicit: force PyTorch's SDPA dispatcher to prefer
-# SDPBackend.FLASH_ATTENTION (falling through to EFFICIENT_ATTENTION, then
-# MATH, only if flash genuinely isn't available for the given shapes/dtype/
-# GPU), and check once at startup so a missing flash kernel on this
-# particular ROCm/PyTorch build is a loud message instead of a silent,
-# permanent slowdown you'd only notice from a lower-than-expected tok/s much
-# later. sdpa_kernel wraps model() calls below and affects every
-# F.scaled_dot_product_attention call inside the model's forward, including
-# ones inside modeling_nanity.py -- no changes needed there.
+# Conversation -> (ids, mask, is_answer). Canonical implementation -- both
+# prepare_data.py and train_nanity_fixed.py call this, so a .bin file
+# written by one always matches what the other would have produced.
 # ---------------------------------------------------------------------------
-try:
-    from torch.nn.attention import sdpa_kernel as _sdpa_kernel, SDPBackend as _SDPBackend
-    _SDPA_PRIORITY = [_SDPBackend.FLASH_ATTENTION, _SDPBackend.EFFICIENT_ATTENTION, _SDPBackend.MATH]
-    _HAVE_SDPA_KERNEL = True
 
-    def flash_attention_context():
-        return _sdpa_kernel(_SDPA_PRIORITY)
-except ImportError:
-    import contextlib
-    _HAVE_SDPA_KERNEL = False
+def normalize_messages(msgs: list[dict]) -> list[dict]:
+    """ShareGPT-style {"from": "human"/"gpt"/"bot", "value": ...} ->
+    {"role": "user"/"assistant"/..., "content": ...}. Passes through
+    messages that already use "role"/"content". Drops any message missing
+    a role or content after normalization."""
+    normed = []
+    for m in msgs:
+        role = m.get("role") or m.get("from", "")
+        role = {"human": "user", "gpt": "assistant", "bot": "assistant"}.get(role, role)
+        content = m.get("content") or m.get("value", "")
+        if role and content:
+            normed.append({"role": role, "content": content})
+    return normed
 
-    def flash_attention_context():
-        return contextlib.nullcontext()
 
+def apply_chat_template(messages: list[dict], tokenizer,
+                         think_end_markers: Optional[list[str]] = None
+                         ) -> tuple[list[int], list[bool], list[bool]]:
+    """Encode a conversation into token ids, a loss mask, and an
+    answer/think split.
 
-def check_flash_attention(device: str, cfg=None, batch: int = 2, probe_seq_len: int = 2048):
-    """One-time startup diagnostic: actually run an SDPA call with ONLY
-    SDPBackend.FLASH_ATTENTION allowed (no fallback), so a missing/broken
-    flash-attention kernel on this specific ROCm/PyTorch build is caught
-    and reported before burning hours of training at math-fallback speed.
-
-    Probes with THIS model's real n_head/n_kv_head/head_dim (via cfg) and
-    GQA (enable_gqa=True whenever n_group > 1) instead of a generic
-    (4-head, head_dim=64) dummy -- flash-kernel support on ROCm's aotriton
-    backend can be head_dim- and GQA-ratio-specific, so a probe using
-    different shapes than the real model can pass while training still
-    silently falls back to a slower backend. Falls back to a generic probe
-    if cfg isn't available yet (e.g. called before the config is built).
+    Returns:
+        ids:         full token sequence (list[int])
+        mask:        True where the loss should be computed (assistant turns only)
+        is_answer:   True for tokens that are the FINAL ANSWER portion of an
+                     assistant turn (only meaningful where mask is True).
+                     False for reasoning/<think> tokens and for all non-
+                     assistant tokens.
     """
-    if device != "cuda":
-        print(f"[flash-attn] device={device!r} -- skipping check (only relevant on "
-              f"CUDA/ROCm)")
-        return
-    if not _HAVE_SDPA_KERNEL:
-        print(f"[flash-attn] WARNING: torch.nn.attention.sdpa_kernel isn't available "
-              f"(torch=={torch.__version__} -- need >=2.3) -- can't force a backend "
-              f"preference. Falling back to whatever SDPA's default heuristic picks, "
-              f"same as before this change.")
-        return
-    if cfg is not None:
-        n_head, n_kv_head, head_dim = cfg.n_head, cfg.n_kv_head, cfg.head_dim
-        enable_gqa = cfg.n_group > 1
-        shape_desc = (f"n_head={n_head}, n_kv_head={n_kv_head}, head_dim={head_dim}, "
-                      f"enable_gqa={enable_gqa}, batch={batch}, seq_len={probe_seq_len}")
-    else:
-        n_head = n_kv_head = 4
-        head_dim = 64
-        enable_gqa = False
-        shape_desc = "generic probe (cfg not available yet)"
-    try:
-        q = torch.randn(batch, n_head, probe_seq_len, head_dim, device=device, dtype=torch.bfloat16)
-        k = torch.randn(batch, n_kv_head, probe_seq_len, head_dim, device=device, dtype=torch.bfloat16)
-        v = torch.randn(batch, n_kv_head, probe_seq_len, head_dim, device=device, dtype=torch.bfloat16)
-        with _sdpa_kernel([_SDPBackend.FLASH_ATTENTION]):
-            F.scaled_dot_product_attention(q, k, v, is_causal=True, enable_gqa=enable_gqa)
-        print(f"[flash-attn] OK -- SDPBackend.FLASH_ATTENTION is available on this "
-              f"build (torch=={torch.__version__}) for this model's actual attention "
-              f"shape ({shape_desc}). Forward passes below are wrapped to prefer it "
-              f"over the memory-efficient/math fallbacks.")
-    except Exception as e:
-        print(f"[flash-attn] WARNING: SDPBackend.FLASH_ATTENTION is NOT available for "
-              f"this model's attention shape ({shape_desc}) on this build ({e!r}) -- "
-              f"training will run on SDPBackend.EFFICIENT_ATTENTION instead, which is "
-              f"slower AND (unlike flash) materializes the full [batch, heads, seq, "
-              f"seq] score matrix, so it's the exact memory-bandwidth-bound scenario "
-              f"you're trying to avoid. This usually means the installed ROCm/PyTorch "
-              f"wheel doesn't ship aotriton flash kernels for this head_dim/GQA-ratio "
-              f"combo on this GPU's architecture (gfx942 for MI300X) -- check "
-              f"`python3 -c \"import torch; print(torch.__version__, torch.version.hip)\"` "
-              f"against PyTorch's ROCm release notes, and consider ROCm/flash-attention "
-              f"(https://github.com/ROCm/flash-attention) as a direct alternative if "
-              f"the built-in SDPA dispatcher doesn't cover this shape.")
+    if think_end_markers is None:
+        think_end_markers = DEFAULT_THINK_END_MARKERS
+
+    ids: list[int] = []
+    mask: list[bool] = []
+    is_answer: list[bool] = []
+
+    def enc(text: str) -> list[int]:
+        return tokenizer.encode(text, add_special_tokens=False)
+
+    def add(token_ids: list[int], is_loss: bool, is_ans: bool = False):
+        ids.extend(token_ids)
+        mask.extend([is_loss] * len(token_ids))
+        is_answer.extend([is_ans] * len(token_ids))
+
+    def split_think_answer(content: str) -> tuple[str, str]:
+        earliest = None
+        for m in think_end_markers:
+            idx = content.find(m)
+            if idx != -1 and (earliest is None or idx < earliest[0]):
+                earliest = (idx, m)
+        if earliest is None:
+            return "", content
+        idx, m = earliest
+        split_at = idx + len(m)
+        return content[:split_at], content[split_at:]
+
+    for msg in messages:
+        role    = msg["role"]
+        content = msg["content"]
+        is_asst = role == "assistant"
+
+        add(enc(ROLE_TOKEN.get(role, f"<|{role}|>")), is_loss=False)
+
+        if is_asst:
+            think_text, answer_text = split_think_answer(content)
+            if think_text:
+                add(enc(think_text), is_loss=True, is_ans=False)
+            add(enc(answer_text), is_loss=True, is_ans=True)
+        else:
+            add(enc(content), is_loss=False)
+
+        add(enc(END_TOKEN), is_loss=is_asst, is_ans=is_asst)
+
+    return ids, mask, is_answer
+
+
+def crop_preserving_answer(ids: list[int], mask: list[bool], is_answer: list[bool],
+                            max_len: int) -> tuple[list, list, list, bool]:
+    """If the sequence is over max_len, drop tokens from the THINK region
+    only (never the answer, never the system/user prompt) until it fits.
+    Returns ok=False if there aren't enough think tokens to drop -- caller
+    should skip the example rather than truncate off the answer."""
+    if len(ids) <= max_len:
+        return ids, mask, is_answer, True
+    excess = len(ids) - max_len
+    think_idx = [i for i in range(len(ids)) if mask[i] and not is_answer[i]]
+    if len(think_idx) < excess:
+        return None, None, None, False
+    drop = set(think_idx[:excess])
+    new_ids       = [t for i, t in enumerate(ids)       if i not in drop]
+    new_mask      = [m for i, m in enumerate(mask)      if i not in drop]
+    new_is_answer = [a for i, a in enumerate(is_answer) if i not in drop]
+    return new_ids, new_mask, new_is_answer, True
+
+
+def tokenize_conversation(messages: list[dict], tokenizer, max_len: int,
+                           id_typecode: str,
+                           think_end_markers: Optional[list[str]] = None
+                           ) -> tuple[Optional[Example], str]:
+    """Full pipeline: apply_chat_template -> crop_preserving_answer -> pack
+    into an Example. Returns (None, "skip"|"overflow") on failure, else
+    (Example, "ok"). was-cropped info is discarded here (prepare_data.py
+    logs aggregate counts itself)."""
+    ids, mask, is_answer = apply_chat_template(messages, tokenizer, think_end_markers)
+    if len(ids) > max_len:
+        ids, mask, is_answer, ok = crop_preserving_answer(ids, mask, is_answer, max_len)
+        if not ok:
+            return None, "overflow"
+    if not any(mask):
+        return None, "skip"
+    packed = Example(
+        array.array(id_typecode, ids),
+        array.array("B", mask),
+        array.array("B", is_answer),
+    )
+    return packed, "ok"
 
 
 # ---------------------------------------------------------------------------
-# LoRA — low-rank adapters for persona fine-tuning (Phase 3).
-#
-# Design intent: the CAPABILITY of a NANITY model (coding, Linux, reasoning)
-# lives in the base weights, trained once via Phase 1/2. A PERSONA (this
-# character's voice, identity, tone) is trained as a small low-rank delta on
-# top -- swappable, forkable, and cheap to retrain against a different base
-# later without repeating distillation. This mirrors NeoCortex's fork/publish
-# model: persona adapters become small, shareable artifacts distinct from
-# the base model they sit on.
-#
-# NEON.cpp / rawllm_loader.hpp do NOT support loading a base + adapter pair
-# at inference time -- validate_config() expects one complete set of
-# blk.{i}.* tensors, full stop. So the adapter is trained separately but
-# MERGED into the base weights (W' = W + alpha/rank * B @ A) before GGUF
-# export. The exported file is an ordinary, complete NANITY GGUF -- no
-# runtime changes needed. True hot-swappable LoRA at inference time would
-# require new C++ work in the loader/forward pass; this is out of scope
-# here and can be added later without touching this training script.
+# Sequence packing -- concatenate many variable-length examples into
+# fixed-length max_len rows instead of leaving each example as its own
+# separately-padded row. Used at TRAIN LOAD TIME (after read_bin_dataset),
+# not at prepare_data.py write time, so max_len can change between runs
+# without needing to regenerate the .bin file.
 # ---------------------------------------------------------------------------
 
-LORA_TARGET_DEFAULT = ["attn_q", "attn_k", "attn_v", "ffn_gate", "ffn_up", "ffn_down"]
+def pack_examples(examples: "list[Example]", max_len: int, pad_id: int = 0,
+                   seed: Optional[int] = None) -> "list[Example]":
+    """Greedily concatenate examples end-to-end into fixed-length max_len
+    sequences ("sequence packing"), instead of leaving each example as its
+    own separately-padded row.
 
+    Why this matters: the trainer's collate_fn right-pads every BATCH to
+    its longest example. For reasoning-trace SFT data (huge length
+    variance -- some conversations are a couple hundred tokens, some run
+    to 8k) or the trailing chunk of each pretrain document (as short as
+    64 tokens, see CHUNK_TOKENS in prepare_data.py), that means most rows
+    in most batches are mostly pad tokens burning GPU cycles for zero
+    loss signal. Packing eliminates almost all of that: every output
+    sequence is exactly max_len (except possibly the very last one in the
+    whole list, which gets padded like before), built by concatenating
+    whole examples back-to-back until the next one wouldn't fit, then
+    starting a fresh sequence.
 
-class LoRALinear(nn.Module):
-    """Wraps a frozen nn.Linear, adding a trainable low-rank delta.
-    forward(x) = base(x) + scaling * (x @ A^T @ B^T)
-    Only A and B receive gradients; base.weight is frozen."""
+    CROSS-DOCUMENT ATTENTION TRADE-OFF: packed sequences are NOT isolated
+    with a block-diagonal attention mask -- a token near the start of an
+    example CAN attend to the tail end of the previous example packed
+    into the same row (RoPE positions also just keep incrementing across
+    the boundary, they're not reset to 0 per document). This is the
+    standard trade-off essentially every from-scratch packed-pretraining
+    setup makes, because a real block-diagonal mask requires passing an
+    explicit attn_mask into the model -- which is exactly what disables
+    the SDPA is_causal fused-kernel fast path this trainer depends on
+    (see the PERF FIX comments around attn_mask in evaluate()/the train
+    loop in train_nanity_fixed.py). Leaving attn_mask=None is what keeps
+    packing compatible with that fast path with zero changes to
+    modeling_nanity.py. If this measurably hurts SFT quality (unrelated
+    conversations blending together near a packing boundary), the real
+    fix is per-document position_id resets plus a varlen/block-causal
+    attention path -- a model-level change, out of scope here.
 
-    def __init__(self, base: nn.Linear, rank: int, alpha: float):
-        super().__init__()
-        self.base = base
-        for p in self.base.parameters():
-            p.requires_grad = False
-        in_f, out_f = base.in_features, base.out_features
-        self.rank = rank
-        self.scaling = alpha / rank
-        # A: (rank, in_f) initialized Kaiming (as in the LoRA paper) so the
-        # adapter starts with a nonzero-but-small random projection.
-        self.lora_A = nn.Parameter(torch.empty(rank, in_f))
-        # B: (out_f, rank) initialized to ZERO so the adapter is a true
-        # no-op at step 0 -- the merged model is byte-identical to the base
-        # until training actually moves B away from zero.
-        self.lora_B = nn.Parameter(torch.zeros(out_f, rank))
-        nn.init.kaiming_uniform_(self.lora_A, a=math.sqrt(5))
-
-    def forward(self, x):
-        base_out = self.base(x)
-        # cast delta compute to the base weight's dtype (handles BF16 models)
-        delta = F.linear(F.linear(x, self.lora_A), self.lora_B) * self.scaling
-        return base_out + delta
-
-    @torch.no_grad()
-    def merged_weight(self) -> torch.Tensor:
-        """Returns base.weight + the folded-in LoRA delta, same shape/dtype
-        as the original nn.Linear.weight. Used at export time."""
-        delta = (self.lora_B @ self.lora_A) * self.scaling   # [out_f, in_f]
-        return self.base.weight + delta.to(self.base.weight.dtype)
-
-
-def inject_lora(model: nn.Module, rank: int, alpha: float,
-                 targets: list[str] = None) -> list[nn.Parameter]:
-    """Freeze every parameter in `model`, then replace each nn.Linear whose
-    attribute name is in `targets` with a LoRALinear wrapper. Returns the
-    list of newly-created trainable LoRA parameters (for the optimizer).
-
-    Only touches per-block attention/FFN projections (matches
-    LORA_TARGET_DEFAULT) -- norms, token_embd, and output stay frozen and
-    shared, which is what keeps a persona adapter small and keeps the
-    underlying capability model's behavior stable."""
-    targets = targets or LORA_TARGET_DEFAULT
-    for p in model.parameters():
-        p.requires_grad = False
-
-    lora_params: list[nn.Parameter] = []
-    blocks = model.blk if hasattr(model, "blk") else model._orig_mod.blk
-    for block in blocks:
-        for sub_name in ("attn", "ffn"):
-            sub = getattr(block, sub_name)
-            for name in targets:
-                if not hasattr(sub, name):
-                    continue
-                orig = getattr(sub, name)
-                if isinstance(orig, LoRALinear):
-                    continue  # already wrapped (e.g. re-injecting on resume)
-                wrapped = LoRALinear(orig, rank=rank, alpha=alpha).to(
-                    next(orig.parameters()).device, next(orig.parameters()).dtype
-                )
-                setattr(sub, name, wrapped)
-                lora_params.extend([wrapped.lora_A, wrapped.lora_B])
-
-    n_trainable = sum(p.numel() for p in lora_params)
-    n_total = sum(p.numel() for p in model.parameters())
-    print(f"[lora] injected rank={rank} alpha={alpha} into {targets}")
-    print(f"[lora] trainable params: {n_trainable:,} / {n_total:,} "
-          f"({100 * n_trainable / n_total:.3f}% of model)")
-    return lora_params
-
-
-def save_lora_checkpoint(model: nn.Module, step: int, out_dir: Path,
-                          hf_sync: Optional["HFSync"] = None):
-    """Saves ONLY the LoRA A/B matrices, not the base weights -- this is
-    what makes a persona adapter small (tens of MB, not GB) and what makes
-    it a distinct, forkable artifact from the base capability model."""
-    out_dir.mkdir(parents=True, exist_ok=True)
-    path = out_dir / f"lora_{step:07d}.pt"
-    state = {}
-    blocks = model.blk if hasattr(model, "blk") else model._orig_mod.blk
-    for i, block in enumerate(blocks):
-        for sub_name in ("attn", "ffn"):
-            sub = getattr(block, sub_name)
-            for name in LORA_TARGET_DEFAULT:
-                mod = getattr(sub, name, None)
-                if isinstance(mod, LoRALinear):
-                    key = f"blk.{i}.{sub_name}.{name}"
-                    state[f"{key}.lora_A"] = mod.lora_A.detach().cpu()
-                    state[f"{key}.lora_B"] = mod.lora_B.detach().cpu()
-                    state[f"{key}.scaling"] = mod.scaling
-    torch.save({"step": step, "lora_state": state}, path)
-    print(f"[lora] adapter saved to {path} ({path.stat().st_size / 1e6:.1f} MB)")
-    if hf_sync is not None:
-        hf_sync.upload_async(path)
-    return path
-
-
-def merge_lora_for_export(model: nn.Module):
-    """In-place: replace every LoRALinear with a plain nn.Linear holding the
-    merged (base + delta) weight. Call this right before building the
-    state_dict for GGUF export -- after this, model.state_dict() has the
-    exact same keys/shapes as a non-LoRA model, so export_gguf() needs no
-    special-casing."""
-    blocks = model.blk if hasattr(model, "blk") else model._orig_mod.blk
-    for block in blocks:
-        for sub_name in ("attn", "ffn"):
-            sub = getattr(block, sub_name)
-            for name in LORA_TARGET_DEFAULT:
-                mod = getattr(sub, name, None)
-                if isinstance(mod, LoRALinear):
-                    merged = nn.Linear(mod.base.in_features, mod.base.out_features, bias=False)
-                    merged.weight = nn.Parameter(mod.merged_weight())
-                    setattr(sub, name, merged)
-    print("[lora] merged all adapters into base weights for export")
-
-# ---------------------------------------------------------------------------
-# Tokenizer helper — wraps HuggingFace AutoTokenizer with the NANITY chat
-# template. We load the tokenizer from the HF repo of whichever base vocab
-# you're using (Phi-4-mini-instruct for the 200064-token vocab). This runs
-# only on the training machine; the GGUF export later carries the raw vocab
-# array that NEON.cpp reads at inference time.
-# ---------------------------------------------------------------------------
-
-def load_tokenizer(name_or_path: str):
-    from transformers import AutoTokenizer
-    tok = AutoTokenizer.from_pretrained(name_or_path, trust_remote_code=True)
-    return tok
-
-
-# ---------------------------------------------------------------------------
-# Dataset
-#
-# apply_chat_template / crop_preserving_answer / Example now live in
-# nanity_data_format.py (imported above) -- shared with prepare_data.py so a
-# .bin file it writes is guaranteed to tokenize identically to this trainer's
-# own JSONL path. See that module's docstring for the full rationale and the
-# .bin file layout.
-# ---------------------------------------------------------------------------
-
-
-# Bump this whenever the Example/cache payload format changes (new fields,
-# different pickling of Example, etc.) -- a stale cache built under an old
-# version is invisible to hash-based invalidation below, since none of the
-# key inputs (tokenizer/max_len/markers/file fingerprint) necessarily change
-# when the *code* that produced the cache changes.
-#
-# v2: Example.ids/mask/is_answer switched from list[int]/list[bool] to
-# array.array (see Example docstring above) to fix an OOM at pretrain
-# scale. This intentionally invalidates any v1 cache on disk -- a v1
-# cache holds plain lists, which downstream code now assumes are arrays.
-_TOKENIZE_CACHE_VERSION = 2
-
-
-def _dataset_cache_key(path: str, tokenizer_source: str, max_len: int,
-                        think_end_markers: list[str] = None) -> str:
-    """Fingerprint of everything that determines the tokenized output for a
-    given JSONL file, so a cache is only ever reused when it's guaranteed to
-    match what re-tokenizing from scratch would produce.
-
-    Uses file size + mtime (cheap, stat-only) rather than a content hash --
-    for a 24GB pretrain file, reading the whole thing just to validate a
-    cache defeats the point of caching. This means an in-place edit that
-    preserves both size and mtime would be missed; that's not a realistic
-    editing pattern for a corpus file, and --data's actual content hash is
-    already computed separately in train() for the .nctr manifest.
+    Order: examples are shuffled once (seeded, so reproducible across
+    resumes) before packing, so which documents end up sharing a row
+    isn't just an accident of file order (e.g. an entire source dataset
+    landing in the same handful of packed blocks because it was
+    contiguous in the .bin file). The packing COMPOSITION is then fixed
+    -- DataLoader(shuffle=True) still reshuffles which packed rows land
+    in which BATCH every epoch, but it can't un-pack and re-pack them.
+    Call this function again (e.g. with a different seed) to get a fresh
+    packing if that fixed composition becomes a concern on a very
+    long run.
     """
-    st = os.stat(path)
-    key_src = "|".join([
-        str(_TOKENIZE_CACHE_VERSION),
-        str(tokenizer_source),
-        str(max_len),
-        ",".join(think_end_markers) if think_end_markers else "",
-        str(st.st_size),
-        str(int(st.st_mtime)),
-    ])
-    return hashlib.sha256(key_src.encode()).hexdigest()[:16]
+    if not examples:
+        return []
 
+    id_typecode = examples[0].ids.typecode
+    order = list(range(len(examples)))
+    if seed is not None:
+        random.Random(seed).shuffle(order)
 
-def _dataset_cache_path(path: str, cache_key: str) -> Path:
-    # Sibling file next to the jsonl, e.g. data/pretrain_mix.jsonl ->
-    # data/pretrain_mix.jsonl.<key>.examples.pkl
-    return Path(f"{path}.{cache_key}.examples.pkl")
+    packed: list[Example] = []
+    buf_ids  = array.array(id_typecode)
+    buf_mask = array.array("B")
+    buf_ans  = array.array("B")
+    n_truncated = 0
 
-
-class ConversationDataset(torch.utils.data.Dataset):
-    def __init__(self, path: str, tokenizer, max_len: int = 4096,
-                 think_end_markers: list[str] = None, tokenizer_source: str = None,
-                 num_workers: int = None):
-        # Tokenization here has two costs worth cutting for large (multi-GB,
-        # multi-million-line) pretrain corpora:
-        #
-        #  1. It used to be a single-threaded Python `for` loop over every
-        #     line -- no parallelism at all on the trainer side. Now it's
-        #     spread across a ThreadPoolExecutor. This is safe (unlike the
-        #     multiprocessing.Pool attempt noted below) because the fast
-        #     (Rust-backed) HF tokenizer releases the GIL during the actual
-        #     encode() call, so threads genuinely parallelize the CPU work
-        #     instead of fighting over the interpreter lock. No new
-        #     processes, no POSIX semaphores, no /dev/shm dependency --
-        #     multiprocessing.Pool-based parallelism was tried here before
-        #     and reverted for exactly that reason (BrokenPipeError /
-        #     leaked-semaphore crashes on resource-restricted cloud
-        #     containers). TOKENIZERS_PARALLELISM stays enabled too (see
-        #     near the top of this file) for the tokenizer's own internal
-        #     thread pool per call, on top of this.
-        #
-        #  2. The tokenized result is cached to a sibling
-        #     `<path>.<key>.examples.pkl`, keyed on tokenizer + max_len +
-        #     think_end_markers + a cheap (size, mtime) file fingerprint
-        #     (see _dataset_cache_key). A resumed/retried run against the
-        #     same data+config loads straight from this cache instead of
-        #     re-tokenizing from scratch -- for an 8B-token pretrain file,
-        #     the difference is hours of MI300X idle time on every restart
-        #     versus a few seconds of unpickling.
-        self.examples: list[Example] = []
-        skipped = 0
-        skipped_overflow = 0   # prompt+answer alone exceeded max_len
-        cropped = 0            # fit only after trimming think tokens
-
-        # .bin fast path -- prepare_data.py already ran apply_chat_template +
-        # crop_preserving_answer and packed the result straight to disk, so
-        # there's nothing left to tokenize. This replaces BOTH the JSONL
-        # parsing loop below AND the separate pickle cache (the .bin file
-        # already IS the cache -- reading it is just an array.frombytes()
-        # pass, no re-tokenization, no thread pool needed).
-        if is_bin_file(path):
-            print(f"[dataset] {path} is a pre-tokenized .bin file, loading directly "
-                  f"(no tokenization needed) ...")
-            t0 = time.time()
-            self.examples, bin_header = read_bin_dataset(path)
-            print(f"[dataset] loaded {len(self.examples)} examples from {path} "
-                  f"in {time.time() - t0:.1f}s")
-
-            # The data is already tokenized, so a tokenizer/max_len mismatch
-            # can't be fixed here -- but training silently on ids from the
-            # WRONG tokenizer's vocab (or cropped to a different max_len than
-            # this run's context_length) would corrupt the run, so surface it
-            # loudly instead of failing silently.
-            bin_tok = bin_header.get("tokenizer_source")
-            if tokenizer_source and bin_tok and bin_tok != tokenizer_source:
-                print(f"[dataset] WARNING: {path} was tokenized with "
-                      f"'{bin_tok}' but this run's --tokenizer is "
-                      f"'{tokenizer_source}' -- token ids will NOT match this "
-                      f"tokenizer's vocab. Re-run prepare_data.py with "
-                      f"--tokenizer {tokenizer_source} to regenerate this file.")
-            bin_vocab_ceiling = bin_header.get("vocab_ceiling")
-            if bin_vocab_ceiling is not None and bin_vocab_ceiling != len(tokenizer):
-                print(f"[dataset] WARNING: {path} was tokenized against a "
-                      f"vocab of size {bin_vocab_ceiling}, but this run's "
-                      f"tokenizer has len(tokenizer)={len(tokenizer)} -- "
-                      f"embedding indices may be out of range. Re-run "
-                      f"prepare_data.py with the same tokenizer this training "
-                      f"run uses.")
-            bin_max_len = bin_header.get("max_len")
-            if bin_max_len is not None and bin_max_len > max_len:
-                print(f"[dataset] WARNING: {path} was cropped to max_len="
-                      f"{bin_max_len} at prepare-time, but this run's "
-                      f"max_len={max_len} is smaller -- some examples may "
-                      f"still exceed this run's context_length. Sequences "
-                      f"longer than max_len are NOT re-cropped here (the "
-                      f"data is already tokenized); collate_fn should be "
-                      f"checked if this causes shape errors.")
+    def flush():
+        nonlocal buf_ids, buf_mask, buf_ans
+        if len(buf_ids) == 0:
             return
+        pad_n = max_len - len(buf_ids)
+        if pad_n > 0:
+            buf_ids.extend(array.array(id_typecode, [pad_id]) * pad_n)
+            buf_mask.extend(bytes(pad_n))    # zero-filled
+            buf_ans.extend(bytes(pad_n))
+        packed.append(Example(buf_ids, buf_mask, buf_ans))
+        buf_ids  = array.array(id_typecode)
+        buf_mask = array.array("B")
+        buf_ans  = array.array("B")
 
-        cache_key = _dataset_cache_key(path, tokenizer_source, max_len, think_end_markers)
-        cache_file = _dataset_cache_path(path, cache_key)
-        if cache_file.exists():
+    for i in order:
+        ex = examples[i]
+        n = len(ex.ids)
+        if n > max_len:
+            # Shouldn't happen -- crop_preserving_answer()/CHUNK_TOKENS
+            # upstream both enforce <= max_len -- but don't silently
+            # corrupt a packed row if it ever does anyway; truncate
+            # defensively and warn instead.
+            n_truncated += 1
+            ex = Example(ex.ids[:max_len], ex.mask[:max_len], ex.is_answer[:max_len])
+            n = max_len
+        if len(buf_ids) + n > max_len:
+            flush()
+        buf_ids.extend(ex.ids)
+        buf_mask.extend(ex.mask)
+        buf_ans.extend(ex.is_answer)
+        if len(buf_ids) == max_len:
+            flush()
+    flush()
+
+    if n_truncated:
+        print(f"[pack] WARNING: {n_truncated} example(s) exceeded max_len="
+              f"{max_len} and were truncated before packing -- this should "
+              f"not happen if crop_preserving_answer()/CHUNK_TOKENS upstream "
+              f"are working correctly; investigate before trusting this run.")
+
+    orig_examples = len(examples)
+    orig_tokens = sum(len(ex.ids) for ex in examples)
+    packed_slots = len(packed) * max_len
+    util = 100.0 * orig_tokens / packed_slots if packed_slots else 0.0
+    print(f"[pack] packed {orig_examples:,} examples ({orig_tokens:,} real "
+          f"tokens) into {len(packed):,} sequences of length {max_len} "
+          f"({packed_slots:,} slots, {util:.1f}% token utilization, "
+          f"{100 - util:.1f}% padding) -- was {orig_examples:,} separately-"
+          f"padded rows before packing")
+    return packed
+
+
+# ---------------------------------------------------------------------------
+# .bin writer / reader
+# ---------------------------------------------------------------------------
+
+class BinDatasetWriter:
+    """Streaming writer -- call add_example()/add_ids() per tokenized
+    conversation, then close() (or use as a context manager). Never holds
+    more than one example in memory, so it's safe for multi-GB pretrain
+    corpora with millions of examples."""
+
+    def __init__(self, path, tokenizer_source: str, max_len: int,
+                 vocab_ceiling: int, think_end_markers: Optional[list[str]] = None,
+                 append: bool = False):
+        """append=True: if `path` already exists and is a valid .bin file
+        whose header (tokenizer/max_len/think_end_markers/vocab_ceiling)
+        matches these arguments, open it in append mode and keep writing
+        records after the existing ones -- mirrors the old JSONL "append
+        instead of overwrite so a retry doesn't have to re-pull the
+        expensive part" behavior. If the header doesn't match (or the file
+        doesn't exist), falls back to creating a fresh file, same as
+        append=False."""
+        self.path = Path(path)
+        self.id_typecode = typecode_for_vocab(vocab_ceiling)
+        header = {
+            "tokenizer_source": tokenizer_source,
+            "max_len": max_len,
+            "think_end_markers": list(think_end_markers or DEFAULT_THINK_END_MARKERS),
+            "id_typecode": self.id_typecode,
+            "vocab_ceiling": vocab_ceiling,
+        }
+        self.path.parent.mkdir(parents=True, exist_ok=True)
+
+        if append and self.path.exists():
             try:
-                print(f"[dataset] found tokenization cache {cache_file.name}, loading ...")
-                t0 = time.time()
-                with open(cache_file, "rb") as f:
-                    cached = pickle.load(f)
-                if cached.get("version") == _TOKENIZE_CACHE_VERSION:
-                    self.examples = cached["examples"]
-                    print(f"[dataset] loaded {len(self.examples)} examples from cache "
-                          f"in {time.time() - t0:.1f}s (skipped re-tokenizing {path})")
-                    return
-                print(f"[dataset] cache format version mismatch "
-                      f"({cached.get('version')} != {_TOKENIZE_CACHE_VERSION}), "
-                      f"re-tokenizing")
-            except Exception as e:
-                print(f"[dataset] cache at {cache_file.name} failed to load ({e!r}), "
-                      f"re-tokenizing from scratch")
-
-        def _process_line(line: str):
-            """Runs in a worker thread. Returns one of:
-              None        -- blank line, silently ignored (not counted as skipped)
-              "skip"       -- malformed / no usable messages / no loss tokens
-              "overflow"   -- prompt+answer alone exceeded max_len, uncroppable
-              (Example, was_cropped) -- a usable example
-            """
-            line = line.strip()
-            if not line:
-                return None
-            obj = json.loads(line)
-            msgs = obj.get("messages") or obj.get("conversations") or obj
-            if not isinstance(msgs, list):
-                return "skip"
-            # normalise "from"/"value" (ShareGPT style) -> "role"/"content"
-            normed = []
-            for m in msgs:
-                role = m.get("role") or m.get("from", "")
-                role = {"human": "user", "gpt": "assistant", "bot": "assistant"}.get(role, role)
-                content = m.get("content") or m.get("value", "")
-                if role and content:
-                    normed.append({"role": role, "content": content})
-            if not normed:
-                return "skip"
-            ids, mask, is_answer = apply_chat_template(
-                normed, tokenizer, think_end_markers=think_end_markers)
-            was_cropped = False
-            if len(ids) > max_len:
-                ids, mask, is_answer, ok = crop_preserving_answer(ids, mask, is_answer, max_len)
-                if not ok:
-                    return "overflow"
-                was_cropped = True
-            if not any(mask):   # no assistant tokens → useless example
-                return "skip"
-            # Pack into compact fixed-width buffers here, per-example, in the
-            # worker thread -- this is what keeps peak RSS bounded instead of
-            # ballooning as boxed-int lists across millions of examples.
-            packed = Example(
-                array.array(id_typecode, ids),
-                array.array("B", mask),
-                array.array("B", is_answer),
-            )
-            return (packed, was_cropped)
-
-
-
-        workers = num_workers or min(32, (os.cpu_count() or 4))
-
-        # A cheap streaming pass just to count lines for progress reporting.
-        # This reads the file sequentially but discards each line
-        # immediately (no accumulation), unlike f.readlines() below, which
-        # used to load the ENTIRE file into RAM as one big list of Python
-        # str objects before tokenization even started -- on a 24GB
-        # pretrain file that's 24-30GB gone up front, on top of whatever
-        # the tokenization itself needs.
-        t_count0 = time.time()
-        with open(path, "rb") as f:
-            total_lines = sum(1 for _ in f)
-        print(f"[dataset] {total_lines} lines in {path} "
-              f"(counted in {time.time() - t_count0:.1f}s)")
-
-        # array.array needs a fixed-width integer typecode. 'H' (unsigned
-        # short, 2 bytes) covers any vocab up to 65536 -- true for gpt2
-        # (50257) but NOT for larger vocabs like Phi-4-mini's 200064, where
-        # 'H' would silently wrap around and corrupt token ids above 65535.
-        # len(tokenizer) (not just tokenizer.vocab_size, which can exclude
-        # added/special tokens) is the real ceiling on any id encode() can
-        # produce, so it's what decides the typecode here.
-        vocab_ceiling = len(tokenizer)
-        id_typecode = "H" if vocab_ceiling <= 0xFFFF else "I"
-        print(f"[dataset] packing token ids as array.array('{id_typecode}') "
-              f"(tokenizer vocab size {vocab_ceiling})")
-
-        # Stream + process in bounded chunks rather than submitting every
-        # line to the thread pool up front. Submitting all ~5M lines at
-        # once would hold every raw line string AND every Future object
-        # simultaneously for the entire run; chunking keeps only one
-        # bounded window of (raw text + in-flight futures) alive at a time,
-        # while still getting full multi-threaded throughput within each
-        # chunk. Chunk size is a multiple of the worker count so the pool
-        # stays fully occupied.
-        CHUNK = max(workers * 64, 2048)
-        print(f"[dataset] tokenizing across {workers} threads in chunks of {CHUNK} "
-              f"(fast tokenizer releases the GIL, so this is real parallel CPU work) ...")
-        t0 = time.time()
-        done_n = 0
-        with open(path) as f, ThreadPoolExecutor(max_workers=workers) as pool:
-            line_iter = iter(f)
-            while True:
-                chunk = list(itertools.islice(line_iter, CHUNK))
-                if not chunk:
-                    break
-                # .result() below is called in submission order (not
-                # as_completed order), which keeps example order identical
-                # to the source file -- deterministic output/cache contents
-                # regardless of which thread happens to finish first.
-                futures = [pool.submit(_process_line, ln) for ln in chunk]
-                for fut in futures:
-                    r = fut.result()
-                    done_n += 1
-                    if done_n % 100_000 == 0:
-                        print(f"  ...{done_n}/{total_lines} lines processed, "
-                              f"{len(self.examples)} kept so far")
-                    if r is None:
-                        continue
-                    elif r == "skip":
-                        skipped += 1
-                    elif r == "overflow":
-                        skipped += 1
-                        skipped_overflow += 1
-                    else:
-                        ex, was_cropped = r
-                        if was_cropped:
-                            cropped += 1
-                        self.examples.append(ex)
-
-        print(f"[dataset] tokenized {total_lines} lines in {time.time() - t0:.1f}s "
-              f"using {workers} threads")
-        print(f"[dataset] loaded {len(self.examples)} examples, skipped {skipped} from {path}")
-        if cropped or skipped_overflow:
-            print(f"[dataset] {cropped} example(s) exceeded max_len={max_len} and had "
-                  f"think-tokens trimmed to preserve the full answer; "
-                  f"{skipped_overflow} example(s) had prompt+answer alone "
-                  f"exceeding max_len and were skipped entirely (increase "
-                  f"--max-seq-len / context_length if this number is large).")
-
-        try:
-            t0 = time.time()
-            tmp_file = cache_file.with_suffix(cache_file.suffix + ".tmp")
-            with open(tmp_file, "wb") as f:
-                pickle.dump({"version": _TOKENIZE_CACHE_VERSION, "examples": self.examples},
-                            f, protocol=pickle.HIGHEST_PROTOCOL)
-            tmp_file.replace(cache_file)  # atomic on POSIX -- no half-written cache on crash
-            print(f"[dataset] wrote tokenization cache to {cache_file.name} "
-                  f"in {time.time() - t0:.1f}s (future runs against this file/config "
-                  f"will skip re-tokenizing)")
-        except Exception as e:
-            print(f"[dataset] warning: failed to write tokenization cache ({e!r}) -- "
-                  f"training continues, but this run's tokenization won't be reusable")
-
-    def __len__(self):
-        return len(self.examples)
-
-    def __getitem__(self, idx):
-        ex = self.examples[idx]
-        return ex.ids, ex.mask, ex.is_answer
-
-
-def split_train_val(ds: "ConversationDataset", val_split: float, seed: int = 1234):
-    """Deterministically carve off val_split fraction of ds as a held-out
-    validation set, EXCLUDED from training. Same seed every run -> the same
-    examples are held out across resumes, so val loss stays comparable
-    across the whole run instead of drifting because the split changed.
-
-    This is what actually lets you tell "the model is learning" apart from
-    "the model is memorizing": train loss goes down either way, but val
-    loss only goes down in the first case. If val loss flattens or rises
-    while train loss keeps falling, that gap IS the overfitting signal.
-    """
-    n = len(ds)
-    n_val = max(1, int(n * val_split)) if val_split > 0 else 0
-    if n_val == 0 or n_val >= n:
-        return ds, None
-    g = torch.Generator().manual_seed(seed)
-    perm = torch.randperm(n, generator=g).tolist()
-    val_idx = set(perm[:n_val])
-    train_examples = [ex for i, ex in enumerate(ds.examples) if i not in val_idx]
-    val_examples = [ex for i, ex in enumerate(ds.examples) if i in val_idx]
-
-    train_ds = ConversationDataset.__new__(ConversationDataset)
-    train_ds.examples = train_examples
-    val_ds = ConversationDataset.__new__(ConversationDataset)
-    val_ds.examples = val_examples
-    print(f"[val] held out {len(val_examples)}/{n} examples for validation "
-          f"({val_split*100:.1f}%), {len(train_examples)} remain for training")
-    return train_ds, val_ds
-
-
-@torch.no_grad()
-def evaluate(model, val_loader, device, max_batches: int) -> dict:
-    """Average CE loss over up to max_batches of val_loader, broken out by
-    think vs. answer tokens. Deliberately plain CE (no label smoothing, no
-    KL term, no reweighting) regardless of training phase, so the numbers
-    are comparable across phases and directly interpretable as 'how
-    surprised is the model by real held-out tokens.'
-
-    Returns a dict with 'loss' (overall), 'think_loss', 'answer_loss'.
-    answer_loss is the one that actually tells you if the model is getting
-    better at producing correct final answers, as opposed to just fluent
-    reasoning-style text."""
-    was_training = model.training
-    model.eval()
-    total_losses, think_losses, answer_losses = [], [], []
-    for i, (input_ids, labels, attn_mask, answer_mask) in enumerate(val_loader):
-        if i >= max_batches:
-            break
-        # PERF FIX: non_blocking=True lets these four H2D copies overlap
-        # with host-side work instead of each one blocking the calling
-        # thread -- safe here specifically because val_loader has
-        # pin_memory=True, so the source tensors are already page-locked.
-        input_ids   = input_ids.to(device, non_blocking=True)
-        labels      = labels.to(device, non_blocking=True)
-        attn_mask   = attn_mask.to(device, non_blocking=True)
-        answer_mask = answer_mask.to(device, non_blocking=True)
-        # PERF FIX: do NOT pass attention_mask here. This is right-padded
-        # causal LM data -- a real token at position i only ever attends
-        # backward to positions 0..i, which are always real content (pad
-        # only ever comes after). Padding rows' own garbage output is
-        # harmless since their loss is masked with -100. Passing an
-        # explicit mask forces attn_mask is not None in the model,
-        # which disables the is_causal fast path and routes SDPA off
-        # the fused flash-attention kernel on ROCm -- a large, silent
-        # slowdown. Leaving attn_mask=None lets is_causal=True fire.
-        #
-        # PERF FIX 2: compute valid (assistant-turn) positions BEFORE the
-        # forward pass and pass them in via select_positions, so the model
-        # only ever projects loss-bearing hidden states to vocab space.
-        # Previously this ran the full (batch*seq, vocab) projection and
-        # only *afterward* selected valid rows -- for reasoning-trace data
-        # where ~15% of tokens are loss-bearing, that's ~5-6x more logits
-        # memory than necessary. This function runs every --val-every
-        # steps, so left unfixed it was a second, periodic OOM trigger
-        # independent of the one in the main loop.
-        valid = (labels.view(-1) != -100)
-        valid_idx = valid.nonzero(as_tuple=True)[0]
-        with flash_attention_context():
-            logits_valid, _ = model(input_ids, select_positions=valid_idx)
-        logits_valid = logits_valid.float()
-        labels_valid = labels.view(-1).index_select(0, valid_idx)
-        answer_sub = answer_mask.view(-1).index_select(0, valid_idx)
-        think_sub  = ~answer_sub
-        per_tok = F.cross_entropy(
-            logits_valid, labels_valid, reduction="none",
-        )
-        if valid.any():
-            total_losses.append(per_tok.mean().item())
-        if think_sub.any():
-            think_losses.append(per_tok[think_sub].mean().item())
-        if answer_sub.any():
-            answer_losses.append(per_tok[answer_sub].mean().item())
-    if was_training:
-        model.train()
-    return {
-        "loss":        sum(total_losses) / max(len(total_losses), 1),
-        "think_loss":  sum(think_losses) / max(len(think_losses), 1) if think_losses else float("nan"),
-        "answer_loss": sum(answer_losses) / max(len(answer_losses), 1) if answer_losses else float("nan"),
-    }
-
-
-def compute_used_vocab_mask(datasets: list, vocab_size: int, tokenizer=None) -> torch.Tensor:
-    """Boolean mask, True for every vocab id that appears anywhere (as an
-    input token, not just a loss target) across the given datasets. Also
-    always marks the tokenizer's special/control tokens as used, regardless
-    of frequency, since those need to stay trainable no matter what.
-
-    Used by --freeze-unseen-vocab to pin every OTHER row of the (tied)
-    embedding/LM-head at its random init, instead of letting cross-entropy's
-    softmax normalization slowly suppress them just for never being the
-    target on English-only data.
-    """
-    used = torch.zeros(vocab_size, dtype=torch.bool)
-    for ds in datasets:
-        if ds is None:
-            continue
-        for ex in ds.examples:
-            idx = torch.tensor(ex.ids, dtype=torch.long)
-            used[idx] = True
-    if tokenizer is not None:
-        for tid in tokenizer.all_special_ids:
-            if 0 <= tid < vocab_size:
-                used[tid] = True
-    return used
-
-
-_ARRAY_TYPECODE_TO_NP = {"H": np.uint16, "I": np.uint32, "B": np.uint8}
-
-
-def collate_fn(batch, pad_id: int = 0):
-    """Right-pad to the longest sequence in the batch.
-
-    PERF FIX: this used to loop over every token in every example in plain
-    Python (`for j, is_loss in enumerate(msk): ...`) to build labels/
-    answer_mask, plus `torch.tensor(ids, ...)` on a raw array.array, which
-    iterates it element-by-element rather than using the buffer protocol.
-    For long reasoning-trace sequences (up to 8k tokens) at even a modest
-    batch size, that's tens of thousands of Python-level operations PER
-    BATCH, called every single training step -- on a rented cloud box with
-    modest per-core speed, this is exactly the kind of CPU-side collation
-    cost that can cap end-to-end tokens/sec well below what the GPU could
-    otherwise sustain, especially with only a couple of DataLoader workers.
-
-    Fix: array.array -> numpy via the buffer protocol (zero-copy) ->
-    torch (zero-copy from numpy) -> vectorized dtype casts and boolean
-    ops. No per-token Python-level loop anywhere in this function now.
-    """
-    ids_list, mask_list, is_answer_list = zip(*batch)
-    lengths = [len(x) for x in ids_list]
-    max_len = max(lengths)
-    bsz = len(ids_list)
-
-    input_ids   = torch.full((bsz, max_len), pad_id, dtype=torch.long)
-    labels      = torch.full((bsz, max_len), -100,   dtype=torch.long)
-    attn_mask   = torch.zeros((bsz, max_len), dtype=torch.bool)
-    answer_mask = torch.zeros((bsz, max_len), dtype=torch.bool)
-
-    for i, (ids, msk, is_ans, n) in enumerate(zip(ids_list, mask_list, is_answer_list, lengths)):
-        # np.frombuffer shares memory with the array.array (no copy); the
-        # subsequent torch.from_numpy also shares memory with that numpy
-        # view. Only the final dtype upcast (.long()/.bool()) actually
-        # copies, and that's a single vectorized C-level op instead of a
-        # Python loop.
-        ids_np = np.frombuffer(ids, dtype=_ARRAY_TYPECODE_TO_NP[ids.typecode])
-        msk_np = np.frombuffer(msk, dtype=np.uint8)
-        ans_np = np.frombuffer(is_ans, dtype=np.uint8)
-
-        ids_t = torch.from_numpy(ids_np).long()
-        msk_t = torch.from_numpy(msk_np).bool()
-        ans_t = torch.from_numpy(ans_np).bool()
-
-        input_ids[i, :n]   = ids_t
-        attn_mask[i, :n]   = True
-        labels[i, :n]      = torch.where(msk_t, ids_t, torch.full_like(ids_t, -100))
-        answer_mask[i, :n] = ans_t & msk_t
-
-    return input_ids, labels, attn_mask, answer_mask
-
-
-# ---------------------------------------------------------------------------
-# LR schedule: linear warmup → cosine decay → small constant floor
-# ---------------------------------------------------------------------------
-
-def cosine_lr(step: int, warmup: int, total: int, lr_max: float, lr_min: float) -> float:
-    if step < warmup:
-        return lr_max * step / max(warmup, 1)
-    if step >= total:
-        return lr_min
-    progress = (step - warmup) / max(total - warmup, 1)
-    return lr_min + 0.5 * (lr_max - lr_min) * (1 + math.cos(math.pi * progress))
-
-
-# ---------------------------------------------------------------------------
-# Teacher wrapper (optional, for online distillation)
-# ---------------------------------------------------------------------------
-
-class Teacher:
-    """Wraps a HuggingFace causal LM loaded in 4-bit for online distillation.
-    Loads ONLY for --phase distill when --teacher is provided.
-    MI300X with 192GB HBM can hold DeepSeek-R1-70B in 4-bit (~35GB) +
-    the 4B student in BF16 (~8GB) + optimizer states (~16GB) comfortably."""
-
-    def __init__(self, name_or_path: str, device: str):
-        try:
-            from transformers import AutoModelForCausalLM, BitsAndBytesConfig
-        except ImportError:
-            sys.exit("pip install transformers bitsandbytes for online distillation")
-
-        print(f"[teacher] loading {name_or_path} in 4-bit on {device} ...")
-        bnb = BitsAndBytesConfig(load_in_4bit=True, bnb_4bit_compute_dtype=torch.bfloat16)
-        self.model = AutoModelForCausalLM.from_pretrained(
-            name_or_path, quantization_config=bnb, device_map=device,
-            trust_remote_code=True,
-        )
-        self.model.eval()
-        print(f"[teacher] loaded.")
-
-    @torch.no_grad()
-    def logits(self, input_ids: torch.Tensor, attention_mask: torch.Tensor) -> torch.Tensor:
-        out = self.model(input_ids=input_ids, attention_mask=attention_mask)
-        return out.logits.float()
-
-
-# ---------------------------------------------------------------------------
-# Checkpoint helpers
-# ---------------------------------------------------------------------------
-
-def save_checkpoint(model, optimizer, step, loss, out_dir: Path, cfg: NanityConfig,
-                     train_meta: Optional[dict] = None,
-                     hf_sync: Optional["HFSync"] = None):
-    out_dir.mkdir(parents=True, exist_ok=True)
-    path = out_dir / f"ckpt_{step:07d}.pt"
-    torch.save({
-        "step":          step,
-        "loss":          loss,
-        "model":         model.state_dict(),
-        "optimizer":     optimizer.state_dict(),
-        "nanity_config": cfg.__dict__,
-        # BUG: none of this was ever recorded anywhere before -- a checkpoint
-        # carried enough to resume training but nothing about HOW it was
-        # trained, so export_nctr()'s manifest had nothing real to read.
-        # Kept as its own dict (not flattened into the top level) so old
-        # checkpoints without it still load fine via load_checkpoint()'s
-        # existing ckpt.get(...) pattern.
-        "train_meta":    train_meta or {},
-    }, path)
-    # keep only the 3 most recent checkpoints to save disk
-    ckpts = sorted(out_dir.glob("ckpt_*.pt"))
-    for old in ckpts[:-3]:
-        old.unlink()
-    print(f"[ckpt] saved {path}")
-    if hf_sync is not None:
-        hf_sync.upload_async(path)
-    return path
-
-
-def load_checkpoint(path: str, model, optimizer=None):
-    ckpt = torch.load(path, map_location="cpu", weights_only=False)
-    model.load_state_dict(ckpt["model"])
-    if optimizer is not None and "optimizer" in ckpt:
-        optimizer.load_state_dict(ckpt["optimizer"])
-    step = ckpt.get("step", 0)
-    print(f"[ckpt] resumed from {path} at step {step}")
-    return step
-
-
-# ---------------------------------------------------------------------------
-# HuggingFace Hub sync -- push every .pt to a HF model repo as soon as it's
-# written to local disk.
-#
-# Why: rented cloud GPU instances (MI300X spot/on-demand boxes, etc.) wipe
-# local disk on shutdown or preemption with no warning, and few providers
-# offer 20GB+ persistent single-file storage. A checkpoint that only exists
-# on the instance's local disk is one preemption away from being gone --
-# this makes the Hub the durable copy instead of something remembered as a
-# separate manual step after the fact.
-#
-# Uploads run in a background thread so they never block the training loop
-# (an upload can take longer than the gap between saves); wait() is called
-# once at the very end of train() -- including on error / Ctrl-C, via a
-# try/finally -- so the last in-flight upload isn't dropped when the
-# process exits.
-# ---------------------------------------------------------------------------
-
-try:
-    from huggingface_hub import HfApi
-    _HF_HUB_AVAILABLE = True
-except ImportError:
-    _HF_HUB_AVAILABLE = False
-
-import threading
-
-
-class HFSync:
-    def __init__(self, repo_id: str, token: Optional[str] = None,
-                 private: bool = True):
-        if not _HF_HUB_AVAILABLE:
-            raise RuntimeError(
-                "--hf-repo was given but huggingface_hub is not installed. "
-                "Run: pip install huggingface_hub"
-            )
-        self.repo_id = repo_id
-        self.token = token
-        self.api = HfApi(token=token)
-        self.api.create_repo(repo_id, token=token, private=private,
-                              repo_type="model", exist_ok=True)
-        self._threads: list = []
-        self._lock = threading.Lock()
-        print(f"[hf] syncing checkpoints to https://huggingface.co/{repo_id}"
-              f"{' (private)' if private else ''}")
-
-    def upload_async(self, path: Path, path_in_repo: Optional[str] = None):
-        """Fire-and-forget upload of one file. Never raises -- a failed
-        upload is logged but does not interrupt training, since the
-        checkpoint is still safe on local disk either way."""
-        path_in_repo = path_in_repo or path.name
-
-        def _do():
-            try:
-                self.api.upload_file(
-                    path_or_fileobj=str(path),
-                    path_in_repo=path_in_repo,
-                    repo_id=self.repo_id,
-                    token=self.token,
-                    commit_message=f"checkpoint: {path_in_repo}",
-                )
-                print(f"[hf] uploaded {path_in_repo}")
-            except Exception as e:
-                print(f"[hf] WARNING: upload of {path_in_repo} failed "
-                      f"(checkpoint is still safe locally at {path}): {e}")
-
-        t = threading.Thread(target=_do, daemon=True)
-        with self._lock:
-            self._threads = [th for th in self._threads if th.is_alive()]
-            self._threads.append(t)
-        t.start()
-
-    def wait(self):
-        """Block until every in-flight upload has finished. Call this
-        before the process exits so the last checkpoint isn't lost."""
-        with self._lock:
-            threads = list(self._threads)
-        if threads:
-            print(f"[hf] waiting on {len(threads)} in-flight upload(s)...")
-        for t in threads:
-            t.join()
-
-
-# ---------------------------------------------------------------------------
-# Build tokenizer.* GGUF keys directly from an HF tokenizer -- no donor GGUF
-# required. Mirrors the standard llama.cpp GPT-2-style (byte-level BPE)
-# vocab conversion: vocab list + token types from AutoTokenizer, merges +
-# special-token ids from the tokenizer's own files via gguf.SpecialVocab.
-# ---------------------------------------------------------------------------
-
-def write_tokenizer_keys_from_hf(writer, tokenizer_name_or_path: str):
-    import tempfile
-    try:
-        import gguf
-        from gguf.constants import TokenType
-    except ImportError:
-        sys.exit("pip install gguf")
-    from transformers import AutoTokenizer
-
-    print(f"[export] loading HF tokenizer {tokenizer_name_or_path} ...")
-    tok = AutoTokenizer.from_pretrained(tokenizer_name_or_path, trust_remote_code=True)
-
-    # gguf.SpecialVocab reads tokenizer.json / tokenizer_config.json /
-    # special_tokens_map.json off disk (for merges + special-token ids), so
-    # save a local snapshot even if tokenizer_name_or_path is a hub id.
-    with tempfile.TemporaryDirectory() as tmp:
-        tok.save_pretrained(tmp)
-
-        vocab = tok.get_vocab()  # token string -> id
-        vocab_size = max(vocab.values()) + 1
-        reverse_vocab = {v: k for k, v in vocab.items()}
-        added = set(tok.get_added_vocab().values())
-        special_strs = set(tok.all_special_tokens)
-
-        tokens, toktypes = [], []
-        for i in range(vocab_size):
-            if i not in reverse_vocab:
-                # Some HF vocabs have gaps; GGUF needs a dense id->token array.
-                tokens.append(f"[UNUSED{i}]")
-                toktypes.append(TokenType.UNUSED)
-                continue
-            token = reverse_vocab[i]
-            tokens.append(token)
-            if i in added and token in special_strs:
-                toktypes.append(TokenType.CONTROL)
-            elif i in added:
-                toktypes.append(TokenType.USER_DEFINED)
-            else:
-                toktypes.append(TokenType.NORMAL)
-
-        writer.add_tokenizer_model("gpt2")  # byte-level BPE, matches NEON.cpp's codec
-        writer.add_token_list(tokens)
-        writer.add_token_types(toktypes)
-
-        special_vocab = gguf.SpecialVocab(tmp, load_merges=True)
-        special_vocab.add_to_gguf(writer)
-
-    print(f"[export] wrote {len(tokens):,} tokenizer entries from {tokenizer_name_or_path}")
-
-
-# ---------------------------------------------------------------------------
-# GGUF export — reads the Phi-4-mini tokenizer GGUF (or any NANITY GGUF that
-# carries the tokenizer keys) and writes a new GGUF with the trained weights.
-# ---------------------------------------------------------------------------
-
-def export_gguf(
-    checkpoint_path: str,
-    output_path: str,
-    tokenizer_source_gguf: Optional[str] = None,
-    quant: str = "F16",
-    lora_checkpoint: Optional[str] = None,
-    tokenizer_hf: Optional[str] = None,
-):
-    """Export a training checkpoint to a NANITY GGUF file.
-
-    tokenizer_source_gguf: path to any existing NANITY GGUF that carries the
-    tokenizer.ggml.* keys (e.g. an old out4.gguf). If given, those keys are
-    copied verbatim into the new file rather than regenerating them.
-
-    tokenizer_hf: HF tokenizer id or local path (e.g.
-    "microsoft/Phi-4-mini-instruct"). If tokenizer_source_gguf is NOT given,
-    this is used instead -- the tokenizer.* keys are built fresh from the HF
-    tokenizer (vocab + merges + special tokens), so you never need a
-    pre-existing donor GGUF just to export a checkpoint. This is the normal
-    path the first time you export a model.
-
-    Exactly one of tokenizer_source_gguf / tokenizer_hf must be given.
-
-    lora_checkpoint: optional path to a persona adapter saved by
-    save_lora_checkpoint(). If given, checkpoint_path MUST be the base
-    capability checkpoint that adapter was trained against -- the adapter
-    deltas get folded into the base weights before writing, so the output
-    is one complete, ordinary GGUF (no runtime changes needed to load it).
-    """
-    if not tokenizer_source_gguf and not tokenizer_hf:
-        sys.exit("export_gguf needs either tokenizer_source_gguf (an existing "
-                  "NANITY GGUF) or tokenizer_hf (an HF tokenizer id/path). "
-                  "If you don't have a donor GGUF yet, pass --tokenizer "
-                  "(e.g. microsoft/Phi-4-mini-instruct) instead of --tokenizer-gguf.")
-    try:
-        import gguf
-        from gguf.constants import GGMLQuantizationType
-    except ImportError:
-        sys.exit("pip install gguf")
-    import numpy as np
-
-    ckpt = torch.load(checkpoint_path, map_location="cpu", weights_only=False)
-    cfg_dict = ckpt.get("nanity_config", {})
-    cfg = NanityConfig(**cfg_dict)
-    model = NanityForCausalLM(cfg)
-    model.load_state_dict(ckpt["model"])
-
-    if lora_checkpoint:
-        print(f"[export] merging LoRA adapter from {lora_checkpoint} ...")
-        lora_ckpt = torch.load(lora_checkpoint, map_location="cpu", weights_only=False)
-        lora_state = lora_ckpt["lora_state"]
-        n_merged = 0
-        for i, block in enumerate(model.blk):
-            for sub_name in ("attn", "ffn"):
-                sub = getattr(block, sub_name)
-                for name in LORA_TARGET_DEFAULT:
-                    key = f"blk.{i}.{sub_name}.{name}"
-                    if f"{key}.lora_A" not in lora_state:
-                        continue
-                    orig = getattr(sub, name)
-                    A = lora_state[f"{key}.lora_A"]
-                    B = lora_state[f"{key}.lora_B"]
-                    scaling = lora_state[f"{key}.scaling"]
-                    delta = (B @ A) * scaling
-                    orig.weight = nn.Parameter(orig.weight + delta.to(orig.weight.dtype))
-                    n_merged += 1
-        print(f"[export] merged {n_merged} adapted projections into base weights")
-
-    model.eval()
-
-    quant_type = {
-        "F32": GGMLQuantizationType.F32,
-        "F16": GGMLQuantizationType.F16,
-        "Q4_0": GGMLQuantizationType.Q4_0,
-    }.get(quant.upper(), GGMLQuantizationType.F16)
-
-    def to_np(t: torch.Tensor) -> np.ndarray:
-        return t.detach().float().numpy()
-
-    def write_tensor(writer, name: str, weight: torch.Tensor):
-        arr = to_np(weight)
-        if quant_type == GGMLQuantizationType.F32:
-            data = arr.astype(np.float32)
-        elif quant_type == GGMLQuantizationType.F16:
-            data = arr.astype(np.float16)
-        else:
-            data = gguf.quants.quantize(arr.astype(np.float32), quant_type)
-        writer.add_tensor(name, data, raw_dtype=quant_type)
-
-    # --- tokenizer keys: either copied from an existing NANITY GGUF, or
-    # built fresh from an HF tokenizer if no donor GGUF is available ---
-    src_reader = None
-    if tokenizer_source_gguf:
-        print(f"[export] copying tokenizer keys from {tokenizer_source_gguf} ...")
-        src_reader = gguf.GGUFReader(tokenizer_source_gguf)
-
-    print(f"[export] writing {output_path} ...")
-    writer = gguf.GGUFWriter(output_path, arch="nanity", use_temp_file=True)
-
-    # architecture metadata (spec section 3)
-    meta = cfg.to_gguf_metadata()
-    for k, v in meta.items():
-        vtype = type(v)
-        if isinstance(v, str):
-            writer.add_string(k, v)
-        elif isinstance(v, float):
-            writer.add_float32(k, v)
-        else:
-            writer.add_uint32(k, int(v))
-
-    # general.name
-    writer.add_string("general.name", "NANITY 4B")
-
-    if src_reader is not None:
-        # tokenizer keys copied verbatim from the donor GGUF
-        from gguf.constants import GGUFValueType
-        skip = {"GGUF.version", "GGUF.tensor_count", "GGUF.kv_count",
-                "general.architecture", "general.name"} | set(meta.keys())
-        for key, field in src_reader.fields.items():
-            if key in skip or key.startswith("nanity.") or key.startswith("GGUF."):
-                continue
-            main_type = field.types[0]
-            val = field.contents()
-            sub_type = field.types[-1] if main_type == GGUFValueType.ARRAY else None
-            try:
-                writer.add_key_value(key, val, main_type, sub_type=sub_type)
+                existing = read_bin_header(self.path)
             except Exception:
-                pass
-    else:
-        # tokenizer keys built fresh from an HF tokenizer -- no donor GGUF
-        # needed. This is the byte-level BPE (GPT-2/tiktoken-family) path,
-        # matching NEON.cpp's codec.
-        write_tokenizer_keys_from_hf(writer, tokenizer_hf)
+                existing = None
+            if existing == header:
+                self._f: BinaryIO = open(self.path, "ab")
+                self.n_written = 0
+                return
+            elif existing is not None:
+                print(f"[nanity_data_format] {self.path} exists but its header "
+                      f"doesn't match this run's tokenizer/max_len/"
+                      f"think_end_markers -- overwriting instead of appending "
+                      f"(existing: {existing}, this run: {header})")
 
-    # tensors — same name convention as modeling_nanity.py's state_dict,
-    # which mirrors the GGUF tensor names from the spec exactly.
-    sd = model.state_dict()
+        header_bytes = json.dumps(header).encode("utf-8")
+        self._f = open(self.path, "wb")
+        self._f.write(MAGIC)
+        self._f.write(struct.pack(_HEADER_LEN_FMT, len(header_bytes)))
+        self._f.write(header_bytes)
+        self.n_written = 0
 
-    write_tensor(writer, "token_embd.weight",  sd["token_embd.weight"])
-    write_tensor(writer, "output_norm.weight", sd["output_norm.weight"])
-    if "output.weight" in sd:
-        write_tensor(writer, "output.weight", sd["output.weight"])
-    # tied embeddings: no output.weight → NEON reuses token_embd
+    def add_example(self, ex: Example):
+        self.add_arrays(ex.ids, ex.mask, ex.is_answer)
 
-    for i in range(cfg.n_layer):
-        prefix = f"blk.{i}"
-        sd_prefix = f"blk.{i}"
-        write_tensor(writer, f"{prefix}.attn_norm.weight",   sd[f"{sd_prefix}.attn_norm.weight"])
-        write_tensor(writer, f"{prefix}.attn_q.weight",      sd[f"{sd_prefix}.attn.attn_q.weight"])
-        write_tensor(writer, f"{prefix}.attn_k.weight",      sd[f"{sd_prefix}.attn.attn_k.weight"])
-        write_tensor(writer, f"{prefix}.attn_v.weight",      sd[f"{sd_prefix}.attn.attn_v.weight"])
-        write_tensor(writer, f"{prefix}.attn_output.weight", sd[f"{sd_prefix}.attn.attn_output.weight"])
-        write_tensor(writer, f"{prefix}.ffn_norm.weight",    sd[f"{sd_prefix}.ffn_norm.weight"])
-        write_tensor(writer, f"{prefix}.ffn_gate.weight",    sd[f"{sd_prefix}.ffn.ffn_gate.weight"])
-        write_tensor(writer, f"{prefix}.ffn_up.weight",      sd[f"{sd_prefix}.ffn.ffn_up.weight"])
-        write_tensor(writer, f"{prefix}.ffn_down.weight",    sd[f"{sd_prefix}.ffn.ffn_down.weight"])
-        print(f"  layer {i+1}/{cfg.n_layer} written", end="\r", flush=True)
+    def add_arrays(self, ids: "array.array", mask: "array.array", is_answer: "array.array"):
+        n = len(ids)
+        if n == 0:
+            return
+        if ids.typecode != self.id_typecode:
+            ids = array.array(self.id_typecode, ids)
+        if sys.byteorder != "little":
+            ids = array.array(ids.typecode, ids)
+            ids.byteswap()
+        self._f.write(struct.pack(_RECORD_LEN_FMT, n))
+        self._f.write(ids.tobytes())
+        self._f.write(bytes(bytearray(mask)))
+        self._f.write(bytes(bytearray(is_answer)))
+        self.n_written += 1
 
-    print()
-    writer.write_header_to_file()
-    writer.write_kv_data_to_file()
-    writer.write_tensors_to_file(progress=True)
-    writer.close()
-    size_gb = Path(output_path).stat().st_size / 1e9
-    print(f"[export] done: {size_gb:.2f} GB written to {output_path}")
+    def close(self):
+        self._f.close()
 
+    def __enter__(self):
+        return self
 
-# ---------------------------------------------------------------------------
-# NCTR export — the .nctr counterpart to export_gguf() above. Reads the
-# exact same checkpoint format (same torch.load, same NanityConfig, same
-# state_dict key convention) so a checkpoint can be exported to EITHER
-# container from the same training run, for the GGUF-vs-NCTR bit-identical
-# output comparison. Layout matches rawllm_nctr_loader.hpp's NCTRHeader and
-# build_tensor_table() exactly -- if either changes, update both sides.
-# ---------------------------------------------------------------------------
-
-def export_nctr(
-    checkpoint_path: str,
-    output_path: str,
-    tokenizer_hf: str,
-    lora_checkpoint: Optional[str] = None,
-):
-    """Export a training checkpoint to a NANITY .nctr file (F32 only for
-    now -- quantized NCTR export, like quantized GGUF export, is a useful
-    follow-up but not required to get a model loading)."""
-    import struct
-    import numpy as np
-    from transformers import AutoTokenizer
-
-    ckpt = torch.load(checkpoint_path, map_location="cpu", weights_only=False)
-    cfg_dict = ckpt.get("nanity_config", {})
-    cfg = NanityConfig(**cfg_dict)
-    model = NanityForCausalLM(cfg)
-    model.load_state_dict(ckpt["model"])
-
-    if lora_checkpoint:
-        print(f"[export] merging LoRA adapter from {lora_checkpoint} ...")
-        lora_ckpt = torch.load(lora_checkpoint, map_location="cpu", weights_only=False)
-        lora_state = lora_ckpt["lora_state"]
-        for i, block in enumerate(model.blk):
-            for sub_name in ("attn", "ffn"):
-                sub = getattr(block, sub_name)
-                for name in LORA_TARGET_DEFAULT:
-                    key = f"blk.{i}.{sub_name}.{name}"
-                    if f"{key}.lora_A" not in lora_state:
-                        continue
-                    orig = getattr(sub, name)
-                    A = lora_state[f"{key}.lora_A"]
-                    B = lora_state[f"{key}.lora_B"]
-                    scaling = lora_state[f"{key}.scaling"]
-                    delta = (B @ A) * scaling
-                    orig.weight = nn.Parameter(orig.weight + delta.to(orig.weight.dtype))
-
-    model.eval()
-    sd = model.state_dict()
-
-    def f32_bytes(t: torch.Tensor) -> bytes:
-        return t.detach().float().numpy().astype(np.float32).tobytes()
-
-    # ── manifest (see the .nctr manifest schema) ────────────────────────────
-    # tm is empty {} for checkpoints saved before train_meta existed --
-    # every .get() below has a fallback so old checkpoints still export,
-    # just with a thinner (but honestly thinner, not fabricated) manifest.
-    tm = ckpt.get("train_meta", {}) or {}
-
-    manifest = {
-        "nctr_manifest_version": 1,
-        "architecture": {"name": "nanity", "spec_version": cfg.spec_version},
-        "model": {
-            "n_layer": cfg.n_layer, "n_head": cfg.n_head, "n_kv_head": cfg.n_kv_head,
-            "head_dim": cfg.head_dim, "n_ff": cfg.n_ff, "ctx_len": cfg.context_length,
-        },
-        "base_weights": (
-            {"type": "checkpoint",
-             "parent_path": tm.get("resumed_from"),
-             "parent_weights_sha256": tm.get("resumed_from_sha256")}
-            if tm.get("resumed_from") else {"type": "from_scratch"}
-        ),
-        "tokenizer": {"source": "huggingface", "repo": tokenizer_hf},
-        "teacher_models": (
-            [{"role": "distillation_teacher", "repo": tm["teacher_hf"]}]
-            if tm.get("teacher_hf") else []
-        ),
-        "dataset_recipe": (
-            [{"phase": tm.get("phase", "unknown"),
-              "source": tm.get("data_path"),
-              "content_sha256": tm.get("data_sha256")}]
-            if tm.get("data_path") else []
-        ),
-        "optimizer": tm.get("optimizer", {}),
-        "training_trajectory": {"steps_completed": ckpt.get("step", 0)},
-        "convergence_snapshot": {"final_training_loss": ckpt.get("loss")},
-        "reproducibility_env": {
-            "seed": tm.get("seed"),
-            "precision": "fp32",
-            "framework": tm.get("framework", f"torch=={torch.__version__}"),
-        },
-    }
-    if not tm:
-        print("[export] WARNING: this checkpoint has no train_meta (saved "
-              "before that was added, or via a different training run) -- "
-              "the manifest's dataset/optimizer/seed fields will be empty "
-              "rather than fabricated. Re-train or re-save to get a full "
-              "manifest.")
-    manifest_bytes = json.dumps(manifest).encode("utf-8")
-
-    # ── tokenizer section (plain JSON, same shape NCTRLoader expects) ──────
-    print(f"[export] loading HF tokenizer {tokenizer_hf} ...")
-    tok = AutoTokenizer.from_pretrained(tokenizer_hf, trust_remote_code=True)
-    vocab = tok.get_vocab()
-    vocab_size = max(vocab.values()) + 1
-    reverse_vocab = {v: k for k, v in vocab.items()}
-    tokens = [reverse_vocab.get(i, f"[UNUSED{i}]") for i in range(vocab_size)]
-    tokenizer_json = {
-        "tokens": tokens,
-        "merges": [],   # NEON's greedy matcher doesn't consume merges (see spec §7); omitted, not lost
-        "bos_id": tok.bos_token_id if tok.bos_token_id is not None else 1,
-        "eos_id": tok.eos_token_id if tok.eos_token_id is not None else 2,
-        "unk_id": tok.unk_token_id if tok.unk_token_id is not None else 0,
-    }
-    tokenizer_bytes = json.dumps(tokenizer_json).encode("utf-8")
-
-    if vocab_size != cfg.vocab_size:
-        print(f"[export] WARNING: tokenizer vocab ({vocab_size}) != "
-              f"cfg.vocab_size ({cfg.vocab_size}) -- token_embd.weight's "
-              f"row count won't match the tokenizer NEON loads. This is "
-              f"almost certainly wrong; double check --tokenizer matches "
-              f"what this checkpoint was actually trained against.")
-
-    # ── tensor table, in the EXACT order build_tensor_table() expects ──────
-    order = ["token_embd.weight", "output_norm.weight"]
-    if "output.weight" in sd:
-        order.append("output.weight")
-    for i in range(cfg.n_layer):
-        p = f"blk.{i}"
-        order += [
-            f"{p}.attn_norm.weight",
-            (f"{p}.attn_q.weight",      f"{p}.attn.attn_q.weight"),
-            (f"{p}.attn_k.weight",      f"{p}.attn.attn_k.weight"),
-            (f"{p}.attn_v.weight",      f"{p}.attn.attn_v.weight"),
-            (f"{p}.attn_output.weight", f"{p}.attn.attn_output.weight"),
-            f"{p}.ffn_norm.weight",
-            (f"{p}.ffn_gate.weight",    f"{p}.ffn.ffn_gate.weight"),
-            (f"{p}.ffn_up.weight",      f"{p}.ffn.ffn_up.weight"),
-            (f"{p}.ffn_down.weight",    f"{p}.ffn.ffn_down.weight"),
-        ]
-
-    data_blobs, table_entries = [], []
-    cursor = 0
-    for entry in order:
-        sd_key = entry[1] if isinstance(entry, tuple) else entry
-        blob = f32_bytes(sd[sd_key])
-        table_entries.append((0, cursor, len(blob)))   # quant_type=0 (F32)
-        data_blobs.append(blob)
-        cursor += len(blob)
-    data_section = b"".join(data_blobs)
-    tensor_table = b"".join(struct.pack("<IQQ", t, o, n) for t, o, n in table_entries)
-
-    HEADER_SIZE = 116
-    manifest_off  = HEADER_SIZE
-    tokenizer_off = manifest_off + len(manifest_bytes)
-    table_off     = tokenizer_off + len(tokenizer_bytes)
-    data_off      = table_off + len(tensor_table)
-
-    use_swiglu     = "output.weight" not in sd or True  # NANITY spec v1 has no non-SwiGLU export path here
-    has_output     = "output.weight" in sd
-    flags = (1 if use_swiglu else 0) | ((1 << 1) if has_output else 0)
-
-    header = struct.pack(
-        "<4s" + "I"*10 + "ff" + "I" + "f" + "II" + "Q"*6,
-        b"NCTR", 1, cfg.spec_version,
-        cfg.vocab_size, cfg.n_embd, cfg.n_layer,
-        cfg.n_head, cfg.n_kv_head, cfg.head_dim, cfg.n_ff, cfg.context_length,
-        cfg.rope_freq_base, cfg.rope_scale_linear, cfg.rope_dimension_count,
-        cfg.rms_norm_eps, flags, 32,
-        manifest_off, len(manifest_bytes),
-        tokenizer_off, len(tokenizer_bytes),
-        table_off, data_off,
-    )
-    assert len(header) == HEADER_SIZE, f"header packed to {len(header)} bytes, expected {HEADER_SIZE}"
-
-    with open(output_path, "wb") as f:
-        f.write(header + manifest_bytes + tokenizer_bytes + tensor_table + data_section)
-
-    size_gb = Path(output_path).stat().st_size / 1e9
-    print(f"[export] done: {size_gb:.2f} GB written to {output_path} "
-          f"({len(order)} tensors, F32)")
+    def __exit__(self, *exc):
+        self.close()
 
 
-# ---------------------------------------------------------------------------
-# Training loop
-# ---------------------------------------------------------------------------
+def read_bin_header(path) -> dict:
+    """Just the header -- cheap, for validating a .bin against the
+    tokenizer/max_len/think_end_markers a training run was invoked with,
+    without loading the whole file."""
+    with open(path, "rb") as f:
+        magic = f.read(len(MAGIC))
+        if magic != MAGIC:
+            raise ValueError(f"{path}: not a NANITY .bin file (bad magic)")
+        (header_len,) = struct.unpack(_HEADER_LEN_FMT, f.read(4))
+        return json.loads(f.read(header_len).decode("utf-8"))
 
-def train(args):
-    # ── reproducibility ────────────────────────────────────────────────────
-    # BUG: nothing seeded any RNG anywhere in this script before now -- every
-    # run's data shuffling, dropout (if any), and sampling-adjacent randomness
-    # was unreproducible, which made a "reproducibility_env.seed" manifest
-    # field (see export_nctr below) actively misleading to write: it would
-    # have recorded a number that didn't actually determine anything.
-    random.seed(args.seed)
-    torch.manual_seed(args.seed)
-    if torch.cuda.is_available():
-        torch.cuda.manual_seed_all(args.seed)
 
-    # ── device ──────────────────────────────────────────────────────────────
-    # BUG: this used to just check torch.cuda.is_available() and, if False,
-    # print one easy-to-miss WARNING line and silently continue on CPU --
-    # which on a 4.5B model looks indistinguishable from "hanging" (a step
-    # that takes seconds on MI300X takes many minutes on CPU, with the same
-    # sparse print cadence). On a ROCm box "no GPU found" is almost always
-    # one of a small number of causes, so surface them instead of guessing:
-    #   1. torch was installed from the default PyPI index (CPU/CUDA wheel)
-    #      instead of the ROCm wheel (--index-url .../whl/rocm6.2) -- the
-    #      single most common cause. Check: python3 -c "import torch;
-    #      print(torch.version.hip)" -- if that prints None, this is it.
-    #   2. Container/session was started without GPU device passthrough
-    #      (needs --device=/dev/kfd --device=/dev/dri and the render group).
-    #   3. ROCR_VISIBLE_DEVICES / HIP_VISIBLE_DEVICES is set to empty or
-    #      excludes the card (check `echo $ROCR_VISIBLE_DEVICES`).
-    #   4. rocminfo doesn't see the card at all (driver/host issue, not a
-    #      Python/torch issue).
-    hip_version = getattr(torch.version, "hip", None)
-    if torch.cuda.is_available():
-        device = "cuda"
-        gpu_name = torch.cuda.get_device_name(0)
-        print(f"[hw] GPU: {gpu_name}  (torch={torch.__version__}, "
-              f"rocm/hip={hip_version or 'n/a'})")
-        is_mi300x = "MI300X" in gpu_name or "MI300" in gpu_name
-        # PERF: cudnn.benchmark lets cuDNN/MIOpen autotune and cache the
-        # fastest conv/GEMM algorithm per distinct input shape it sees
-        # instead of always using a generic default -- a real win once
-        # shapes settle down, even with variable seq_len (collate_fn only
-        # produces a handful of distinct (batch, padded_len) shapes per
-        # dataset in practice, not a new one every step). allow_tf32
-        # affects FP32 matmuls only; harmless here since training runs in
-        # BF16, but costs nothing to set for any FP32 path (teacher model,
-        # loss computation) that isn't explicitly BF16.
-        torch.backends.cudnn.benchmark = True
-        torch.backends.cuda.matmul.allow_tf32 = True
-        torch.backends.cudnn.allow_tf32 = True
-        if os.environ.get("PYTORCH_HIP_ALLOC_CONF") is None and \
-           os.environ.get("PYTORCH_CUDA_ALLOC_CONF") is None:
-            print("[hw] tip: if you see OOM after many steps despite a stable "
-                  "per-step memory footprint, that's usually allocator "
-                  "fragmentation, not a real leak. Try setting "
-                  "PYTORCH_HIP_ALLOC_CONF=expandable_segments:True (or "
-                  "PYTORCH_CUDA_ALLOC_CONF on a CUDA build) before launching.")
-    else:
-        device = "cpu"
-        is_mi300x = False
-        print("[hw] ERROR: no GPU visible to torch -- refusing to silently "
-              f"train a 4-5B model on CPU. Diagnostics: torch={torch.__version__}, "
-              f"torch.version.hip={hip_version!r}, "
-              f"ROCR_VISIBLE_DEVICES={os.environ.get('ROCR_VISIBLE_DEVICES')!r}, "
-              f"HIP_VISIBLE_DEVICES={os.environ.get('HIP_VISIBLE_DEVICES')!r}.")
-        if hip_version is None:
-            print("[hw]   -> torch.version.hip is None: this is very likely a "
-                  "CPU-only or CUDA (not ROCm) torch build. Reinstall with:\n"
-                  "         pip install torch torchvision torchaudio "
-                  "--index-url https://download.pytorch.org/whl/rocm6.2")
-        else:
-            print("[hw]   -> torch IS a ROCm build but still sees no device: "
-                  "check the container was launched with GPU passthrough "
-                  "(--device=/dev/kfd --device=/dev/dri) and that "
-                  "`rocminfo` / `rocm-smi` see the card from this shell.")
-        if not args.allow_cpu:
-            sys.exit("[hw] aborting (pass --allow-cpu to force CPU training "
-                      "anyway, e.g. for a quick smoke test).")
-        print("[hw] --allow-cpu set: continuing on CPU anyway (will be very slow).")
+def read_bin_dataset(path) -> tuple[list[Example], dict]:
+    """Reads a .bin file fully into memory and returns (examples, header).
+    This is the ONLY thing train_nanity_fixed.py needs to call to load a
+    pre-tokenized dataset -- no tokenizer, no chat template, no cropping.
 
-    # ── config ───────────────────────────────────────────────────────────────
-    # BUG FIX: args.resume used to be loaded with torch.load() up to THREE
-    # separate times (config here, weights below, plus the never-called
-    # load_checkpoint() helper duplicating both). Each load pulls the WHOLE
-    # checkpoint -- model weights AND optimizer moments, which for a 4.5B
-    # model + AdamW is several times the bare model size -- into host RAM.
-    # Holding 2-3 copies alive at once during resume was real memory
-    # pressure and part of what was pushing this into OOM. Load once, reuse.
-    ckpt_data = None
-    if args.resume:
-        ckpt_data = torch.load(args.resume, map_location="cpu", weights_only=False)
-        cfg = NanityConfig(**ckpt_data["nanity_config"])
-        print(f"[config] loaded from checkpoint: {cfg}")
-    else:
-        cfg = {"4b": NanityConfig.nanity_4b, "1_5b": NanityConfig.nanity_1_5b,
-               "tiny": NanityConfig.nanity_tiny}[args.preset]()
-        print(f"[config] fresh {args.preset} config: {cfg}")
+    BLOCK-READ REWRITE: the previous version called f.read(4) once per
+    record just to get the length prefix, then a couple more small
+    f.read(n*w)/f.read(n)/f.read(n) calls for the payload -- FOUR Python-
+    level read() calls per example. For an 8B-token pretrain file with
+    millions of packed examples, that's tens of millions of individual
+    read() calls, each paying interpreter + (for anything not already in
+    the OS page cache) syscall overhead, even though the underlying
+    io.BufferedReader was already doing some internal buffering.
 
-    check_flash_attention(device, cfg=cfg, batch=args.batch)
+    This version mmaps the whole file once (a single block mapping, not a
+    read -- pages get faulted in by the OS as they're actually touched,
+    so this doesn't front-load the whole file into RAM any harder than
+    reading it would) and walks it with plain offset arithmetic:
+    struct.unpack_from() and array.frombytes() both read directly out of
+    the mmap buffer via the buffer protocol, with zero Python-level I/O
+    calls in the per-record loop at all -- the "read" work reduces to
+    pointer arithmetic over memory the OS has already mapped in.
 
-    # ── model ────────────────────────────────────────────────────────────────
-    model = NanityForCausalLM(cfg).to(device)
+    Falls back to plain buffered reads (the old behavior, just with a much
+    larger buffer) if mmap isn't available for this path (e.g. a 0-byte
+    file, or a filesystem/OS combination that rejects mmap).
+    """
+    path = Path(path)
+    file_size = path.stat().st_size
+    if file_size == 0:
+        raise ValueError(f"{path}: empty file -- was this actually produced "
+                          f"by prepare_data.py?")
 
-    # BF16 conversion — MI300X has native BF16 HGEMM (2x FP32 throughput).
-    # Do this BEFORE torch.compile so the compiler sees BF16 ops.
-    if device == "cuda":
-        model = model.to(torch.bfloat16)
-        print("[precision] BF16 enabled")
+    with open(path, "rb") as f:
+        try:
+            buf = mmap.mmap(f.fileno(), 0, access=mmap.ACCESS_READ)
+        except (ValueError, OSError):
+            # mmap can refuse on some filesystems (network mounts, certain
+            # container overlay setups) -- fall back to a big buffered read
+            # instead of hard-failing the whole load.
+            f.seek(0)
+            buf = f.read()
 
-    # ── load base weights + optionally inject LoRA ─────────────────────────
-    # For LoRA runs, --resume must point at a BASE (capability) checkpoint,
-    # not a previous LoRA adapter -- this loads that base, freezes it, and
-    # injects fresh trainable low-rank adapters on top. Full fine-tune runs
-    # (--lora-rank 0, the default) resume normally with everything trainable.
-    start_step = 0
-    if args.lora_rank > 0:
-        if not args.resume:
-            sys.exit("[error] --lora-rank requires --resume pointing at a trained "
-                      "base capability checkpoint (LoRA adapts an existing base, "
-                      "it doesn't train one from scratch).")
-        model.load_state_dict(ckpt_data["model"])
-        print(f"[lora] loaded base weights from {args.resume}")
-        lora_params = inject_lora(model, rank=args.lora_rank, alpha=args.lora_alpha,
-                                   targets=args.lora_target)
-        # start_step stays 0 -- this is a fresh adapter training run, distinct
-        # from the base checkpoint's own step count.
-    elif args.resume:
-        model.load_state_dict(ckpt_data["model"])
-        start_step = ckpt_data.get("step", 0)
-        print(f"[resume] loaded full checkpoint from {args.resume} at step {start_step}")
+        pos = 0
+        magic = bytes(buf[pos:pos + len(MAGIC)]); pos += len(MAGIC)
+        if magic != MAGIC:
+            raise ValueError(f"{path}: not a NANITY .bin file (bad magic) -- "
+                              f"was this actually produced by prepare_data.py?")
+        (header_len,) = struct.unpack_from(_HEADER_LEN_FMT, buf, pos); pos += 4
+        header = json.loads(bytes(buf[pos:pos + header_len]).decode("utf-8"))
+        pos += header_len
 
-    # torch.compile — works on ROCm via inductor backend; ~20-40% throughput
-    # improvement on MI300X with almost zero code change. Done AFTER LoRA
-    # injection so the compiled graph includes the adapter modules.
-    if is_mi300x and not args.no_compile:
-        print("[compile] torch.compile(inductor, dynamic=True) ...")
-        # PERF FIX: collate_fn right-pads to the longest example PER BATCH,
-        # so seq_len varies from batch to batch (reasoning-trace data is
-        # highly variable-length). Without dynamic=True, torch.compile
-        # specializes on the first shape it sees and RECOMPILES (can be
-        # seconds of dead time) every time a new shape shows up, until it
-        # eventually infers the dim is dynamic on its own -- which can
-        # mean many recompiles early in training instead of settling once.
-        # Declaring it dynamic up front compiles once for varying seq_len.
-        model = torch.compile(model, backend="inductor", dynamic=True)
-        print("[compile] done")
+        id_typecode = header["id_typecode"]
+        itemsize = array.array(id_typecode).itemsize
+        big_endian = sys.byteorder != "little"
 
-    n_params = sum(p.numel() for p in model.parameters() if p.requires_grad)
-    print(f"[model] {n_params / 1e9:.3f}B trainable parameters")
+        examples: list[Example] = []
+        end = len(buf)
+        while pos < end:
+            if pos + 4 > end:
+                break  # truncated trailing record (crashed mid-write) -- stop cleanly
+            (n,) = struct.unpack_from(_RECORD_LEN_FMT, buf, pos); pos += 4
 
-    # ── tokenizer ────────────────────────────────────────────────────────────
-    tok_source = args.tokenizer or "microsoft/Phi-4-mini-instruct"
-    print(f"[tokenizer] loading from {tok_source} ...")
-    tokenizer = load_tokenizer(tok_source)
-    pad_id = tokenizer.pad_token_id or 0
+            ids_nbytes = n * itemsize
+            record_end = pos + ids_nbytes + n + n
+            if record_end > end:
+                break  # same: truncated trailing record, stop cleanly
 
-    # ── dataset ──────────────────────────────────────────────────────────────
-    max_len = args.max_seq_len or cfg.context_length
-    if args.max_seq_len and args.max_seq_len > cfg.context_length:
-        print(f"[warn] --max-seq-len {args.max_seq_len} > cfg.context_length "
-              f"{cfg.context_length}. Training will proceed at this length, "
-              f"but remember to update context_length in modeling_nanity.py "
-              f"and the KV-cache allocation in NEON.cpp before this "
-              f"checkpoint is exported/served, or inference will be capped "
-              f"back down to {cfg.context_length}.")
-    think_end_markers = (args.think_end_markers.split(",") if args.think_end_markers
-                         else None)
-    ds = ConversationDataset(args.data, tokenizer, max_len=max_len,
-                             think_end_markers=think_end_markers,
-                             tokenizer_source=args.tokenizer,
-                             num_workers=args.tokenize_workers)
-    if len(ds) == 0:
-        sys.exit("[error] empty dataset — check your JSONL format")
+            ids = array.array(id_typecode)
+            ids.frombytes(buf[pos:pos + ids_nbytes]); pos += ids_nbytes
+            if big_endian:
+                ids.byteswap()
 
-    # ── training metadata for the .nctr manifest (export_nctr) ─────────────
-    # Content-hashed here, once, rather than at export time -- export_nctr()
-    # might run long after the data file has moved/changed, so the hash
-    # needs to be captured while we know it's the actual file that was used.
-    # PERF/MEMORY FIX: this used to be open(...).read() -- for a multi-GB
-    # .bin pretrain file, that's the whole file loaded into RAM just to hash
-    # it, on top of whatever ConversationDataset already holds. Hash in
-    # fixed-size chunks instead: identical digest, O(1) memory regardless
-    # of file size.
-    def _sha256_file(p: str, chunk_size: int = 1 << 20) -> str:
-        h = hashlib.sha256()
-        with open(p, "rb") as _fh:
-            for chunk in iter(lambda: _fh.read(chunk_size), b""):
-                h.update(chunk)
-        return h.hexdigest()
+            mask = array.array("B")
+            mask.frombytes(buf[pos:pos + n]); pos += n
 
-    import hashlib
-    data_hash = _sha256_file(args.data)
-    resumed_hash = None
-    if args.resume and os.path.isfile(args.resume):
-        resumed_hash = _sha256_file(args.resume)
+            is_answer = array.array("B")
+            is_answer.frombytes(buf[pos:pos + n]); pos += n
 
-    train_meta = {
-        "data_path": args.data,
-        "data_sha256": data_hash,
-        "tokenizer_hf": args.tokenizer,
-        "phase": args.phase,
-        "teacher_hf": args.teacher if (args.phase == "distill" and args.teacher) else None,
-        "seed": args.seed,
-        "optimizer": {
-            "type": "AdamW", "lr": args.lr, "betas": [0.9, 0.95], "eps": 1e-6,
-            "warmup_steps": args.warmup_steps,
-        },
-        "resumed_from": args.resume if args.resume else None,
-        "resumed_from_sha256": resumed_hash,
-        "framework": f"torch=={torch.__version__}",
-    }
+            examples.append(Example(ids, mask, is_answer))
 
-    # held-out validation set: either an explicit --val-data file, or carved
-    # out of --data automatically. Either way it never appears in `loader`.
-    if args.val_data:
-        train_ds = ds
-        val_ds = ConversationDataset(args.val_data, tokenizer, max_len=max_len,
-                                     think_end_markers=think_end_markers,
-                                     tokenizer_source=args.tokenizer,
-                                     num_workers=args.tokenize_workers)
-        print(f"[val] using separate validation file: {args.val_data} "
-              f"({len(val_ds)} examples)")
-    else:
-        train_ds, val_ds = split_train_val(ds, args.val_split)
+        if isinstance(buf, mmap.mmap):
+            buf.close()
 
-    # ── sequence packing (opt-in via --pack-sequences) ─────────────────────
-    # Runs AFTER the train/val split, on already-tokenized Example objects,
-    # so it's a cheap array-concatenation pass regardless of whether the
-    # underlying data came from a .bin file (the common case now) or JSONL.
-    # Train and val are packed separately/independently -- packing never
-    # lets a val example's tokens end up sharing a row with a train example.
-    if args.pack_sequences:
-        print(f"[pack] packing train set (max_len={max_len}) ...")
-        train_ds.examples = pack_examples(train_ds.examples, max_len,
-                                           pad_id=pad_id, seed=args.seed)
-        if val_ds is not None and len(val_ds) > 0:
-            print(f"[pack] packing val set (max_len={max_len}) ...")
-            val_ds.examples = pack_examples(val_ds.examples, max_len,
-                                             pad_id=pad_id, seed=args.seed)
+    return examples, header
 
-    # BUG FIX (Python 3.14 / any 'forkserver' or 'spawn' start method):
-    # `collate_fn=lambda b: collate_fn(b, pad_id=pad_id)` looks harmless but
-    # a lambda closing over a local variable is NOT picklable, and
-    # DataLoader(num_workers>0) has to pickle collate_fn to hand it to each
-    # worker process -- UNLESS the start method is 'fork', which doesn't
-    # pickle at all, it just copies the parent's memory (closures included)
-    # via the OS fork() call. That's exactly why this worked silently on
-    # setups using 'fork' (the POSIX default on older Python) and crashed
-    # the moment it ran under 'forkserver' or 'spawn' (Windows/macOS
-    # always, and POSIX Python 3.14+ by default):
-    # _pickle.PicklingError: Can't pickle local object
-    # 'train.<locals>.<lambda>'. functools.partial over the existing
-    # MODULE-level collate_fn (defined above, not a closure) IS picklable --
-    # same behavior, works under all three start methods, so it doesn't
-    # matter what Python version or OS this runs under.
-    collate = functools.partial(collate_fn, pad_id=pad_id)
 
-    # PERF: worker count now scales with available cores (same affinity-
-    # aware count already used for tokenization) instead of a hardcoded
-    # 4/2. collate_fn is fully vectorized now (see above) so each worker's
-    # per-batch cost is tiny, but more workers still means deeper prefetch
-    # depth and better overlap with the GPU step. persistent_workers avoids
-    # tearing down and respawning the whole worker pool (re-importing
-    # torch/transformers in each subprocess) between epochs, and
-    # prefetch_factor keeps several batches ready ahead of the GPU instead
-    # of just one, so a momentary hiccup in one worker doesn't stall a step.
-    loader_workers = args.tokenize_workers or min(16, (os.cpu_count() or 4))
-    loader = torch.utils.data.DataLoader(
-        train_ds,
-        batch_size=args.batch,
-        shuffle=True,
-        num_workers=loader_workers,
-        pin_memory=(device == "cuda"),
-        persistent_workers=(loader_workers > 0),
-        prefetch_factor=(4 if loader_workers > 0 else None),
-        collate_fn=collate,
-        drop_last=True,
-    )
-    val_loader = None
-    if val_ds is not None and len(val_ds) > 0:
-        val_loader_workers = max(1, loader_workers // 2)
-        val_loader = torch.utils.data.DataLoader(
-            val_ds,
-            batch_size=args.batch,
-            shuffle=False,
-            num_workers=val_loader_workers,
-            pin_memory=(device == "cuda"),
-            persistent_workers=(val_loader_workers > 0),
-            prefetch_factor=(4 if val_loader_workers > 0 else None),
-            collate_fn=collate,
-            drop_last=False,
-        )
-    else:
-        print("[val] WARNING: no validation set available -- early stopping "
-              "and overfit detection are DISABLED. You are back to eyeballing "
-              "train loss and guessing when to abort. Pass --val-data or "
-              "leave --val-split at its default to avoid this.")
-
-    # ── vocab freezing ───────────────────────────────────────────────────────
-    used_vocab_mask = None
-    if args.freeze_unseen_vocab:
-        if args.lora_rank > 0:
-            print("[vocab] --freeze-unseen-vocab has no effect under "
-                  "--lora-rank > 0 -- LoRA already leaves the embedding "
-                  "entirely frozen.")
-        else:
-            used_vocab_mask = compute_used_vocab_mask(
-                [train_ds, val_ds], cfg.vocab_size, tokenizer=tokenizer
-            ).to(device)
-            n_used = int(used_vocab_mask.sum().item())
-            print(f"[vocab] {n_used:,} / {cfg.vocab_size:,} vocab rows appear "
-                  f"in the data ({100 * n_used / cfg.vocab_size:.1f}%). "
-                  f"The remaining {cfg.vocab_size - n_used:,} rows will have "
-                  f"their gradient zeroed every step (still random-init, "
-                  f"ready for a future language) instead of being trained.")
-
-    # ── epoch-aware step sizing ──────────────────────────────────────────────
-    # Train loss alone doesn't tell you "too many steps"; but epoch count
-    # over a KNOWN dataset size is still a useful sanity cap, because it's
-    # the number of times the model has literally seen each example.
-    #
-    # BUG FIX: `step` in the training loop below increments once per
-    # MICRO-batch (once per item pulled from `loader`, i.e. every args.batch
-    # examples) -- an optimizer.step() only happens every args.grad_accum
-    # micro-batches. --steps is compared directly against that micro-batch
-    # counter (`if step >= start_step + args.steps: break`), so --steps is
-    # in micro-batch units. This block used to compute
-    # `steps_per_epoch = len(train_ds) // (batch*grad_accum)` -- i.e.
-    # OPTIMIZER-step units -- and then divided the micro-batch-unit
-    # `args.steps` by it. That mismatch inflated implied_epochs by exactly
-    # grad_accum (e.g. 8x with the default --grad-accum 8), so the
-    # --max-epochs cap fired far earlier than intended and silently
-    # truncated `args.steps` (also assigned back in the wrong, optimizer-step
-    # unit) to a small fraction of what was actually requested/needed.
-    effective_batch = args.batch * args.grad_accum
-    steps_per_epoch_optim = max(1, len(train_ds) // effective_batch)      # optimizer-step units, for display
-    steps_per_epoch_micro = max(1, len(train_ds) // args.batch)           # micro-batch units, matches args.steps
-    implied_epochs = args.steps / steps_per_epoch_micro
-    print(f"[epochs] {len(train_ds)} train examples, effective batch "
-          f"{effective_batch} -> {steps_per_epoch_optim} optimizer steps/epoch "
-          f"({steps_per_epoch_micro} micro-batches/epoch). "
-          f"--steps={args.steps} implies ~{implied_epochs:.1f} epochs.")
-    if args.max_epochs and args.max_epochs > 0 and implied_epochs > args.max_epochs:
-        clipped_steps = int(steps_per_epoch_micro * args.max_epochs)
-        print(f"[epochs] WARNING: {implied_epochs:.1f} epochs over a "
-              f"{len(train_ds)}-example dataset is very likely to memorize "
-              f"a {cfg.n_layer}-layer / multi-billion-param model. Clipping "
-              f"--steps {args.steps} -> {clipped_steps} (--max-epochs "
-              f"{args.max_epochs}). Pass --max-epochs 0 to disable this cap "
-              f"if you're confident you want the full run.")
-        args.steps = clipped_steps
-
-    # ── optimizer ─────────────────────────────────────────────────────────────
-    # LoRA runs: optimizer only ever sees the small adapter params. Full
-    # fine-tune runs: split into two param groups so embeddings/norms get
-    # weight_decay=0 -- standard practice regardless, but ALSO fixes a real
-    # gap in --freeze-unseen-vocab: zeroing the gradient on unused embedding
-    # rows doesn't stop AdamW's decoupled weight decay from still nudging
-    # those rows toward zero every step (decay applies directly to the
-    # parameter value, independent of the gradient). No decay on this
-    # tensor means "frozen" rows are actually fully frozen, not just
-    # slow-drifting.
-    if args.lora_rank > 0:
-        param_groups = lora_params
-    else:
-        decay_params, no_decay_params = [], []
-        for name, p in model.named_parameters():
-            if not p.requires_grad:
-                continue
-            if p.ndim < 2 or "token_embd" in name or "output" in name or "norm" in name:
-                no_decay_params.append(p)
-            else:
-                decay_params.append(p)
-        param_groups = [
-            {"params": decay_params, "weight_decay": 0.1},
-            {"params": no_decay_params, "weight_decay": 0.0},
-        ]
-        print(f"[optimizer] {sum(p.numel() for p in decay_params):,} params with weight_decay, "
-              f"{sum(p.numel() for p in no_decay_params):,} without (embeddings/norms)")
+def is_bin_file(path) -> bool:
+    """Cheap sniff so callers can auto-detect .bin vs .jsonl without relying
+    on the file extension alone (in case someone renames it)."""
+    path = Path(path)
+    if path.suffix == ".bin":
+        return True
     try:
-        optimizer = torch.optim.AdamW(
-            param_groups,
-            lr=args.lr,
-            betas=(0.9, 0.95),
-            eps=1e-6,
-            fused=True,
-        )
-        print("[optimizer] fused AdamW")
-    except TypeError:
-        optimizer = torch.optim.AdamW(
-            param_groups, lr=args.lr, betas=(0.9, 0.95), eps=1e-6,
-        )
-        print("[optimizer] standard AdamW (fused not available)")
-
-    # BUG FIX: optimizer state (Adam's per-parameter running mean/variance)
-    # was never restored on resume -- model.load_state_dict() ran above, but
-    # nothing ever called optimizer.load_state_dict(ckpt_data["optimizer"]).
-    # A load_checkpoint() helper earlier in this file does this correctly
-    # but was dead code, never called anywhere. Net effect: every resume
-    # silently restarted Adam's moments from zero while the model weights
-    # jumped back in from a fully-warmed-up state. The mismatch between
-    # "well-trained weights" and "zeroed optimizer state" produces a burst
-    # of oversized effective step sizes right after resume -- exactly the
-    # kind of transient that spikes activations/gradients and can tip a
-    # borderline-fitting run into OOM, on top of silently corrupting the
-    # optimization trajectory every time you resumed. Only restore for a
-    # full-fidelity resume (not LoRA, which builds a fresh adapter optimizer
-    # every time by design, and not export-only invocations).
-    if args.resume and args.lora_rank == 0 and ckpt_data is not None and "optimizer" in ckpt_data:
-        try:
-            optimizer.load_state_dict(ckpt_data["optimizer"])
-            print("[resume] restored optimizer state (Adam moments) from checkpoint")
-        except (ValueError, KeyError) as e:
-            print(f"[resume] WARNING: could not restore optimizer state "
-                  f"({e}) -- continuing with freshly-initialized optimizer "
-                  f"state. This usually means param_groups shape changed "
-                  f"(e.g. --freeze-unseen-vocab toggled between runs).")
-
-    # free the raw checkpoint dict now that weights + optimizer state have
-    # been consumed -- no reason to keep a second full copy of the model's
-    # state_dict (tensors) alive in host RAM for the rest of the run.
-    del ckpt_data
-
-    # ── teacher (online distillation only) ───────────────────────────────────
-    teacher = None
-    if args.phase == "distill" and args.teacher:
-        teacher = Teacher(args.teacher, device)
-
-    # ── gradient checkpointing — saves memory at the cost of ~30% recompute.
-    # With 192GB HBM this is optional for a 4B model, but enables larger
-    # batch sizes (better gradient estimates) for the same memory budget.
-    if args.grad_ckpt:
-        from torch.utils.checkpoint import checkpoint as grad_checkpoint
-        # patch each block's forward to use gradient checkpointing
-        for block in (model.blk if hasattr(model, "blk") else model._orig_mod.blk):
-            orig_fwd = block.forward
-            def make_ckpt_fwd(f):
-                def ckpt_fwd(*a, **kw):
-                    return grad_checkpoint(f, *a, use_reentrant=False, **kw)
-                return ckpt_fwd
-            block.forward = make_ckpt_fwd(orig_fwd)
-        print("[memory] gradient checkpointing enabled (~30% recompute overhead)")
-
-    # ── training loop ─────────────────────────────────────────────────────────
-    out_dir = Path(args.out)
-
-    hf_sync = None
-    if args.hf_repo:
-        hf_sync = HFSync(args.hf_repo, token=args.hf_token,
-                          private=not args.hf_public)
-        # registered (not just called at the bottom of this function) so the
-        # last in-flight upload still finishes even on Ctrl-C or an
-        # exception mid-training -- exactly the moments an instance is
-        # likeliest to disappear out from under a run.
-        import atexit
-        atexit.register(hf_sync.wait)
-    out_dir.mkdir(parents=True, exist_ok=True)
-    scaler = None   # no GradScaler needed for BF16 on MI300X (BF16 doesn't overflow)
-
-    step       = start_step
-    avg_loss   = 0.0
-    # PERF FIX: these stay as GPU tensors and only get .item()'d once per
-    # log_every steps (see the log block below), instead of every step --
-    # see the note at think_sum_step/answer_sum_step above for why.
-    total_loss_t        = torch.zeros((), device=device)
-    total_think_sum_t   = torch.zeros((), device=device)
-    total_think_cnt_t   = torch.zeros((), device=device)
-    total_answer_sum_t  = torch.zeros((), device=device)
-    total_answer_cnt_t  = torch.zeros((), device=device)
-    tokens_since_log_t  = torch.zeros((), device=device)
-    log_every  = 50
-    save_every = args.save_every
-    t0         = time.time()
-
-    best_val_loss     = float("inf")
-    patience_counter  = 0
-    best_ckpt_step    = start_step
-    lr                = args.lr
-
-    optimizer.zero_grad(set_to_none=True)
-
-    def data_iter() -> Iterator:
-        while True:
-            yield from loader
-
-    print(f"[train] starting phase={args.phase}, steps={args.steps}, "
-          f"batch={args.batch}, grad_accum={args.grad_accum}, "
-          f"lr={args.lr:.2e}")
-
-    for input_ids, labels, attn_mask, answer_mask in data_iter():
-        if step >= start_step + args.steps:
-            break
-
-        # PERF FIX: non_blocking=True (safe with loader's pin_memory=True)
-        # -- these copies can overlap with the tail of the previous step's
-        # CPU-side bookkeeping instead of each blocking in turn.
-        input_ids   = input_ids.to(device, non_blocking=True)
-        labels      = labels.to(device, non_blocking=True)
-        attn_mask   = attn_mask.to(device, non_blocking=True)
-        answer_mask = answer_mask.to(device, non_blocking=True)
-
-        # BUG FIX: forward+backward had no OOM handling at all -- any
-        # transient memory spike (a batch with unusually long sequences
-        # before padding, a stray memory fragment, etc.) raised an
-        # unhandled RuntimeError/OutOfMemoryError straight out of the loop
-        # and killed the whole run, discarding all progress since the last
-        # checkpoint. Catch it, clear the (poisoned) gradient state and the
-        # allocator cache, log GPU memory stats so this is diagnosable
-        # instead of a silent kill, skip this one batch, and keep training.
-        try:
-            # PERF FIX: see the identical note in evaluate() above --
-            # right-padded causal data doesn't need an explicit padding
-            # mask, and passing one here was disabling SDPA's is_causal
-            # fast path (fused flash-attention) on every single forward
-            # pass. attn_mask itself is still used below for token
-            # counting -- only the model call drops it.
-            #
-            # BUG FIX (major OOM cause): the previous version ran the
-            # vocab projection over EVERY position in the batch -- including
-            # every system/user/prompt token, which the loss mask excludes
-            # anyway -- and only selected valid (assistant-turn) rows
-            # *after* that fp32 cast. For vocab_size ~200k, that full
-            # (batch*seq, V) fp32 tensor is e.g. ~13GB at batch=4,
-            # seq=4096, on top of the ~6.5GB bf16 logits tensor already
-            # alive, PLUS cross_entropy's internal softmax buffers of the
-            # same size again -- for a single loss computation, before
-            # backward even starts. Since assistant-turn tokens (answer +
-            # think) are typically a small fraction of a full context
-            # window, compute valid_idx from the labels BEFORE the forward
-            # pass and pass it into the model as select_positions, so only
-            # loss-bearing hidden states are ever projected to vocab space
-            # -- e.g. ~5-10x smaller if only ~15% of the sequence is
-            # assistant tokens, which is common for reasoning data with
-            # long user/system prompts.
-            valid_flat  = (labels.view(-1) != -100)
-            answer_flat_full = answer_mask.view(-1) & valid_flat
-            valid_idx = valid_flat.nonzero(as_tuple=True)[0]
-
-            with flash_attention_context():
-                logits_valid, _ = model(input_ids, select_positions=valid_idx)
-            logits_valid = logits_valid.float()
-            V = logits_valid.shape[-1]
-            labels_valid = labels.view(-1).index_select(0, valid_idx)
-            answer_sub  = answer_flat_full.index_select(0, valid_idx)   # per valid tok
-            think_sub   = ~answer_sub
-
-            # ── Phase-dependent loss ─────────────────────────────────
-            if teacher is not None and args.phase == "distill":
-                # KL divergence between teacher and student on response
-                # tokens. This is the core of distillation: the student
-                # learns to match the teacher's FULL distribution (not
-                # just the argmax), which transfers substantially more
-                # information per example.
-                with torch.no_grad():
-                    t_logits = teacher.logits(input_ids, attn_mask)
-                    # align vocab size if teacher and student differ
-                    v_min = min(V, t_logits.shape[-1])
-                    # same fix as above: select valid rows BEFORE the
-                    # log_softmax/exp blowup over the vocab dimension.
-                    t_logits_valid = t_logits[..., :v_min].view(-1, v_min).index_select(0, valid_idx)
-                s_logits_valid = logits_valid[..., :v_min]
-                t_log_probs = F.log_softmax(t_logits_valid / args.temp_distill, dim=-1)
-                s_log_probs = F.log_softmax(s_logits_valid / args.temp_distill, dim=-1)
-
-                # KL(teacher || student) per-token, over response tokens only
-                kl_per_tok = F.kl_div(s_log_probs, t_log_probs.exp(),
-                                      reduction="none").sum(-1)   # [n_valid]
-
-                # CE per-token on ground-truth labels (anchors generation
-                # to the actual reference text, prevents mode drift away
-                # from the target format)
-                ce_per_tok = F.cross_entropy(
-                    logits_valid, labels_valid,
-                    label_smoothing=args.label_smoothing,
-                    reduction="none",
-                )
-                per_tok = 0.7 * kl_per_tok + 0.3 * ce_per_tok
-
-            else:
-                # Phase 1 (warmup) or Phase 3 (finetune): plain
-                # cross-entropy. label_smoothing caps how low the loss
-                # can go for a single memorized token, which is the main
-                # thing that lets a 4-5B model "solve" a small dataset
-                # by reciting it instead of generalizing from it.
-                per_tok = F.cross_entropy(
-                    logits_valid, labels_valid,
-                    label_smoothing=args.label_smoothing,
-                    reduction="none",
-                )
-
-            # Reasoning-trace data (e.g. OpenThoughts) puts a lot more
-            # <think> tokens than final-answer tokens into each example,
-            # and <think> tokens are typically far more
-            # formulaic/low-entropy. A single scalar loss over all of
-            # them is easy to fool: the model can crater the average by
-            # nailing repetitive reasoning boilerplate while barely
-            # moving on the answer. answer_weight (default 1.0 = no
-            # reweighting) lets the ACTUAL optimization target emphasize
-            # answer tokens; the separate think/answer numbers below let
-            # you see the split regardless of the weight. (per_tok/
-            # answer_sub/think_sub are already restricted to valid
-            # tokens, so no need to multiply by valid_flat again here.)
-            weights = torch.ones_like(per_tok)
-            weights[answer_sub] = args.answer_loss_weight
-            denom = weights.sum().clamp(min=1e-8)
-            loss = (per_tok * weights).sum() / denom
-
-            # PERF FIX: no .item() here -- stay in tensor-land. .item()
-            # forces a CUDA/HIP sync, and doing it every step (instead
-            # of only at log_every) serializes the whole loop: the CPU
-            # can't launch step N+1's kernels until it's finished
-            # blocking on step N's result. Accumulate sums/counts as
-            # GPU tensors instead; only sync once per log_every steps.
-            think_sum_step  = per_tok[think_sub].sum()
-            think_cnt_step  = think_sub.sum()
-            answer_sum_step = per_tok[answer_sub].sum()
-            answer_cnt_step = answer_sub.sum()
-
-            (loss / args.grad_accum).backward()
-        except RuntimeError as e:
-            if "out of memory" not in str(e).lower():
-                raise   # not an OOM -- a real bug, don't paper over it
-            optimizer.zero_grad(set_to_none=True)
-            if device == "cuda":
-                allocated = torch.cuda.memory_allocated() / 1e9
-                reserved  = torch.cuda.memory_reserved() / 1e9
-                torch.cuda.empty_cache()
-                print(f"[oom] step {step}: CUDA/HIP OOM on a batch of shape "
-                      f"{tuple(input_ids.shape)} (allocated={allocated:.1f}GB, "
-                      f"reserved={reserved:.1f}GB before cache clear). Skipping "
-                      f"this batch and clearing the allocator cache. If this "
-                      f"repeats often, lower --batch, raise --grad-accum to "
-                      f"compensate, or pass --grad-ckpt to trade compute for "
-                      f"memory.")
-            else:
-                print(f"[oom] step {step}: out-of-memory on batch shape "
-                      f"{tuple(input_ids.shape)}. Skipping this batch.")
-            continue
-
-        # PERF FIX: all tensor ops, no .item() -- see initializer comment.
-        total_loss_t       += loss.detach()
-        tokens_since_log_t += attn_mask.sum()
-        total_think_sum_t  += think_sum_step.detach()
-        total_think_cnt_t  += think_cnt_step
-        total_answer_sum_t += answer_sum_step.detach()
-        total_answer_cnt_t += answer_cnt_step
-
-        if (step + 1) % args.grad_accum == 0:
-            if used_vocab_mask is not None:
-                # PERF/CORRECTNESS FIX: zero unused-vocab rows BEFORE
-                # clip_grad_norm_, not after. It was previously the other
-                # way around, which contradicted its own comment: clipping
-                # first means clip_grad_norm_'s norm computation DOES
-                # include unused rows' gradients (softmax cross-entropy
-                # gives every vocab row a small nonzero gradient, not just
-                # the target row, so this wasn't a no-op). Doing it first
-                # actually delivers what the comment always claimed.
-                base_model = model._orig_mod if hasattr(model, "_orig_mod") else model
-                embd_grad = base_model.token_embd.weight.grad
-                if embd_grad is not None:
-                    embd_grad[~used_vocab_mask] = 0
-                if base_model.output is not None and base_model.output.weight.grad is not None:
-                    base_model.output.weight.grad[~used_vocab_mask] = 0
-
-            torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0)
-
-            # update LR
-            lr = cosine_lr(step, args.warmup_steps, args.steps, args.lr, args.lr * 0.1)
-            for pg in optimizer.param_groups:
-                pg["lr"] = lr
-            optimizer.step()
-            # PERF: set_to_none=True skips the memset that zeroing every
-            # gradient tensor in place requires -- next backward() just
-            # allocates fresh grad tensors instead. Cheap, and consistent
-            # with the other zero_grad() calls in this function now.
-            optimizer.zero_grad(set_to_none=True)
-
-        step += 1
-
-        if step % log_every == 0:
-            # PERF FIX: this is the ONLY sync point now -- one .item() call
-            # (well, five, but all on the same already-ready tensors, so
-            # it's one sync, not five) every log_every steps instead of
-            # every step. Everything above this point in the loop runs
-            # fully async on the GPU with no CPU blocking.
-            avg_loss   = (total_loss_t / log_every).item()
-            avg_think  = (total_think_sum_t / total_think_cnt_t.clamp(min=1)).item()
-            avg_answer = (total_answer_sum_t / total_answer_cnt_t.clamp(min=1)).item()
-            tokens_since_log = tokens_since_log_t.item()
-            dt = time.time() - t0
-            # BUG FIX: this used to assume every sequence in every batch was
-            # exactly cfg.context_length tokens (log_every * batch *
-            # context_length), but collate_fn right-pads only to the
-            # longest item IN EACH BATCH -- for chat/reasoning data that's
-            # usually well under context_length, so tok/s was consistently
-            # overstated (sometimes by a large factor for short examples).
-            # Use the actual attn_mask token count accumulated above.
-            tok_per_sec = tokens_since_log / dt
-            print(f"[step {step:7d}] loss={avg_loss:.4f}  "
-                  f"think={avg_think:.4f}  answer={avg_answer:.4f}  "
-                  f"lr={lr:.2e}  tok/s={tok_per_sec:,.0f}  dt={dt:.1f}s")
-            total_loss_t.zero_()
-            total_think_sum_t.zero_()
-            total_think_cnt_t.zero_()
-            total_answer_sum_t.zero_()
-            total_answer_cnt_t.zero_()
-            tokens_since_log_t.zero_()
-            t0 = time.time()
-
-        if step % save_every == 0 or step == start_step + args.steps:
-            if args.lora_rank > 0:
-                save_lora_checkpoint(model, step, out_dir, hf_sync=hf_sync)
-            else:
-                save_checkpoint(model, optimizer, step, loss.item(), out_dir, cfg,
-                                 train_meta, hf_sync=hf_sync)
-
-        # ── validation + early stopping ──────────────────────────────────────
-        # This is the actual replacement for "watch the loss and abort by
-        # hand": val loss is the only number in this loop that can tell
-        # memorization apart from learning. Rising/flat val loss next to a
-        # still-falling train loss means the gap between them IS overfitting,
-        # regardless of how low train loss has gotten.
-        #
-        # For reasoning data specifically, early-stopping is tracked on
-        # ANSWER loss, not overall loss -- overall loss is dominated by the
-        # (usually much more numerous, much more formulaic) think tokens, so
-        # it can keep falling from reasoning-style fluency gains long after
-        # the model has stopped improving on the thing that actually
-        # matters: getting the final answer right.
-        if val_loader is not None and step % args.val_every == 0 and step > start_step:
-            val_metrics = evaluate(model, val_loader, device, args.val_batches)
-            val_loss, val_think, val_answer = (
-                val_metrics["loss"], val_metrics["think_loss"], val_metrics["answer_loss"])
-            track_metric = val_answer if not math.isnan(val_answer) else val_loss
-            print(f"[val   {step:7d}] loss={val_loss:.4f}  think={val_think:.4f}  "
-                  f"answer={val_answer:.4f}  (train~{avg_loss:.4f})")
-
-            if track_metric < best_val_loss - args.early_stop_min_delta:
-                best_val_loss = track_metric
-                patience_counter = 0
-                if args.lora_rank > 0:
-                    saved_path = save_lora_checkpoint(model, step, out_dir, hf_sync=hf_sync)
-                    best_path = out_dir / "lora_best.pt"
-                else:
-                    saved_path = save_checkpoint(model, optimizer, step, loss.item(), out_dir, cfg,
-                                                  train_meta, hf_sync=hf_sync)
-                    best_path = out_dir / "ckpt_best.pt"
-                # copy (not just track the step number) so this survives the
-                # keep-3-most-recent rotation in save_checkpoint() even if
-                # training continues well past this point before stopping.
-                import shutil
-                shutil.copy2(saved_path, best_path)
-                if hf_sync is not None:
-                    hf_sync.upload_async(best_path)
-                best_ckpt_step = step
-                print(f"[val   {step:7d}] new best (answer_loss={best_val_loss:.4f}) "
-                      f"-- checkpoint saved ({best_path})")
-            else:
-                patience_counter += 1
-                print(f"[val   {step:7d}] no improvement "
-                      f"({patience_counter}/{args.early_stop_patience} "
-                      f"since best={best_val_loss:.4f})")
-                if (args.early_stop_patience > 0
-                        and patience_counter >= args.early_stop_patience):
-                    print(f"[early-stop] answer loss hasn't improved in "
-                          f"{args.early_stop_patience} checks -- from here "
-                          f"on the model is very likely just getting more "
-                          f"fluent at reasoning-style text without getting "
-                          f"more correct. Stopping at step {step}. Best "
-                          f"checkpoint was at step {best_ckpt_step} "
-                          f"(answer_loss={best_val_loss:.4f}); that's the "
-                          f"one to export.")
-                    break
-
-    print(f"[train] phase {args.phase} complete at step {step}.")
-
-    # auto-export GGUF at end of training, unless --no-auto-export was passed.
-    # Uses --tokenizer-gguf if given (copies keys from a donor GGUF),
-    # otherwise builds tokenizer keys fresh from --tokenizer (HF id/path).
-    if not args.no_auto_export:
-        # If we had a validation set, export the BEST checkpoint (lowest val
-        # loss), not necessarily the last one written -- if early stopping
-        # fired, or val loss simply bottomed out before the final save, the
-        # last step's checkpoint is the more-overfit one.
-        use_best = val_loader is not None and best_ckpt_step > start_step
-        if use_best:
-            print(f"[export] using best checkpoint (step {best_ckpt_step}, "
-                  f"val_loss={best_val_loss:.4f}) instead of final step {step}")
-        out_gguf = str(out_dir / "nanity_4b_final.gguf")
-        tok_gguf = args.tokenizer_gguf
-        tok_hf = None if tok_gguf else args.tokenizer
-        if args.lora_rank > 0:
-            lora_ckpt = out_dir / "lora_best.pt" if use_best else out_dir / f"lora_{step:07d}.pt"
-            export_gguf(args.resume, out_gguf,
-                        tokenizer_source_gguf=tok_gguf, tokenizer_hf=tok_hf,
-                        quant=args.export_quant, lora_checkpoint=str(lora_ckpt))
-        else:
-            final_ckpt = out_dir / "ckpt_best.pt" if use_best else out_dir / f"ckpt_{step:07d}.pt"
-            export_gguf(str(final_ckpt), out_gguf,
-                        tokenizer_source_gguf=tok_gguf, tokenizer_hf=tok_hf,
-                        quant=args.export_quant)
-
-
-# ---------------------------------------------------------------------------
-# CLI
-# ---------------------------------------------------------------------------
-
-def main():
-    ap = argparse.ArgumentParser(description=__doc__,
-                                 formatter_class=argparse.RawDescriptionHelpFormatter)
-    sub = ap.add_subparsers(dest="mode")
-
-    # -- train mode (default if --phase is given) ----------------------------
-    tr = ap
-    tr.add_argument("--preset",      choices=["4b", "1_5b", "tiny"], default="4b",
-                     help="fresh-init architecture preset when not resuming from a checkpoint "
-                          "('tiny' is a ~13M-param CPU smoke-test preset, not a real training config)")
-    tr.add_argument("--phase",       choices=["warmup", "distill", "finetune"],
-                    default="distill")
-    tr.add_argument("--data",        help="path to training data -- a pre-tokenized "
-                                           ".bin file from prepare_data.py (preferred, "
-                                           "no tokenization at train time) or a JSONL file")
-    tr.add_argument("--out",         default="checkpoints/nanity_4b",
-                    help="checkpoint output directory")
-    tr.add_argument("--resume",      help="path to .pt checkpoint to resume from")
-    tr.add_argument("--teacher",     help="HF model id or path for online distillation "
-                                          "(only used with --phase distill)")
-    tr.add_argument("--tokenizer",   default="microsoft/Phi-4-mini-instruct",
-                    help="HF tokenizer id or path (default: Phi-4-mini-instruct)")
-    tr.add_argument("--tokenizer-gguf", dest="tokenizer_gguf",
-                    help="existing NANITY GGUF to copy tokenizer keys from "
-                         "(used for auto-export at end of training)")
-    tr.add_argument("--steps",       type=int, default=50000)
-    tr.add_argument("--batch",       type=int, default=4,
-                    help="per-GPU batch size")
-    tr.add_argument("--grad-accum",  dest="grad_accum", type=int, default=8,
-                    help="gradient accumulation steps (effective batch = batch * grad_accum)")
-    tr.add_argument("--lr",          type=float, default=3e-4)
-    tr.add_argument("--seed",        type=int, default=42,
-                     help="seeds random/torch/cuda RNGs at the start of train() for reproducibility")
-    tr.add_argument("--warmup-steps", dest="warmup_steps", type=int, default=500)
-    tr.add_argument("--save-every",  dest="save_every", type=int, default=2000)
-    tr.add_argument("--grad-ckpt",   dest="grad_ckpt", action="store_true", default=True,
-                    help="enable gradient checkpointing (saves ~40%% VRAM, ~30%% slower). "
-                         "On by default -- it's the cheapest memory lever available; "
-                         "pass --no-grad-ckpt to disable.")
-    tr.add_argument("--no-grad-ckpt", dest="grad_ckpt", action="store_false",
-                    help="disable gradient checkpointing (trades memory for ~30%% more speed)")
-    tr.add_argument("--allow-cpu",   dest="allow_cpu", action="store_true",
-                    help="allow training to proceed on CPU if no GPU is visible "
-                         "to torch (default: abort with diagnostics, since CPU "
-                         "training of a 4-5B model is normally a misconfigured "
-                         "ROCm environment, not an intentional choice)")
-    tr.add_argument("--lora-rank",   dest="lora_rank", type=int, default=0,
-                    help="enable LoRA fine-tuning with this rank (0 = full fine-tune, "
-                         "the default). Typical persona-adapter values: 16-32. "
-                         "Only meaningful with --phase finetune, and requires --resume "
-                         "to start from a trained capability base.")
-    tr.add_argument("--lora-alpha",  dest="lora_alpha", type=float, default=32.0,
-                    help="LoRA scaling alpha (scaling = alpha / rank)")
-    tr.add_argument("--lora-target", dest="lora_target", nargs="+",
-                    default=None,
-                    help=f"which projections to adapt (default: {LORA_TARGET_DEFAULT})")
-    tr.add_argument("--no-compile",  dest="no_compile", action="store_true",
-                    help="disable torch.compile (useful for debugging)")
-    tr.add_argument("--temp-distill", dest="temp_distill", type=float, default=1.0,
-                    help="temperature for distillation KL (1.0 = no sharpening)")
-    tr.add_argument("--export-quant", dest="export_quant", default="F16",
-                    choices=["F32", "F16", "Q4_0"],
-                    help="quantization for auto-export GGUF (default F16)")
-    tr.add_argument("--no-auto-export", dest="no_auto_export", action="store_true",
-                    help="skip automatic GGUF export at the end of training "
-                         "(export manually later with --export/--gguf)")
-
-    # -- HuggingFace Hub sync -------------------------------------------------
-    # Every checkpoint written by save_checkpoint()/save_lora_checkpoint()
-    # (periodic saves, best-val saves) is pushed to this repo in the
-    # background as it's written. Rented GPU instances can vanish with no
-    # warning and no local persistent storage, so this is the durable copy.
-    tr.add_argument("--hf-repo", dest="hf_repo", default=None,
-                    help="HuggingFace repo id to sync every .pt checkpoint "
-                         "to as it's saved, e.g. 'yourname/nectar-checkpoints' "
-                         "(created automatically if it doesn't exist). "
-                         "Requires: pip install huggingface_hub, and "
-                         "authentication via `huggingface-cli login`, the "
-                         "HF_TOKEN env var, or --hf-token.")
-    tr.add_argument("--hf-token", dest="hf_token", default=None,
-                    help="HF access token (needs write access to --hf-repo). "
-                         "If omitted, falls back to the HF_TOKEN env var or "
-                         "a cached `huggingface-cli login` session.")
-    tr.add_argument("--hf-public", dest="hf_public", action="store_true",
-                    help="create --hf-repo as public (default: private)")
-
-    # -- overfitting guards ---------------------------------------------------
-    # A 4-5B model on a dataset of a few thousand (or even tens of thousands)
-    # examples WILL memorize if you run it for enough epochs -- train loss
-    # will glide down toward zero and look "great" right up until the model
-    # is just reciting training examples back. Train loss alone can't tell
-    # you this is happening; you need a held-out set the model never trains
-    # on. These flags make that automatic instead of relying on eyeballing
-    # the log and Ctrl-C'ing when it "looks too low."
-    tr.add_argument("--val-data", dest="val_data",
-                    help="path to held-out validation data (.bin or JSONL, "
-                         "same rules as --data). If omitted, "
-                         "--val-split of --data is carved off automatically "
-                         "(deterministic, seeded) and excluded from training.")
-    tr.add_argument("--val-split", dest="val_split", type=float, default=0.05,
-                    help="fraction of --data to hold out for validation when "
-                         "--val-data is not given (default 0.05 = 5%%)")
-    tr.add_argument("--val-every", dest="val_every", type=int, default=250,
-                    help="run validation every N optimizer steps")
-    tr.add_argument("--val-batches", dest="val_batches", type=int, default=30,
-                    help="number of validation batches to average per eval")
-    tr.add_argument("--early-stop-patience", dest="early_stop_patience", type=int,
-                    default=6,
-                    help="stop training automatically after this many "
-                         "consecutive validations with no improvement in val "
-                         "loss (0 = disable early stopping)")
-    tr.add_argument("--early-stop-min-delta", dest="early_stop_min_delta",
-                    type=float, default=0.01,
-                    help="minimum decrease in val loss to count as an "
-                         "improvement (guards against stopping on noise)")
-    tr.add_argument("--label-smoothing", dest="label_smoothing", type=float,
-                    default=0.05,
-                    help="label smoothing for the CE loss (default 0.05). "
-                         "This is the single biggest lever against the "
-                         "'loss collapses to near-zero' failure mode: it "
-                         "caps how confident the model is rewarded for "
-                         "being on any single token, so it can't just "
-                         "memorize exact training strings for free reward. "
-                         "Set to 0 to disable.")
-    tr.add_argument("--max-epochs", dest="max_epochs", type=float, default=4.0,
-                    help="if --steps would run more than this many epochs "
-                         "over --data, --steps is clipped down and a warning "
-                         "is printed (0 = no cap). Small distillation/"
-                         "self-instruct datasets overfit a 4-5B model fast; "
-                         "3-4 epochs is already generous for that regime.")
-
-    # -- reasoning-trace (think vs. answer) handling --------------------------
-    tr.add_argument("--think-end-markers", dest="think_end_markers", default=None,
-                    help="comma-separated list of substrings marking the end "
-                         "of a chain-of-thought / start of the final answer "
-                         "within an assistant turn (e.g. OpenThoughts uses "
-                         "'<|begin_of_solution|>'). Default covers "
-                         "'<|begin_of_solution|>', '</think>', "
-                         "'<|end_of_thought|>'. Content with none of these "
-                         "markers is entirely counted as 'answer' (never "
-                         "guessed as reasoning).")
-    tr.add_argument("--answer-loss-weight", dest="answer_loss_weight", type=float,
-                    default=1.0,
-                    help="multiply the loss on final-answer tokens by this "
-                         "factor relative to think/reasoning tokens (default "
-                         "1.0 = no reweighting). Reasoning datasets have far "
-                         "more think tokens than answer tokens per example, "
-                         "and think tokens tend to be far more formulaic, so "
-                         "an unweighted average loss can look great from "
-                         "reasoning-style fluency while answer accuracy "
-                         "barely moves. Try 2.0-3.0 if train/val logs show "
-                         "'answer' loss stalling while 'think' loss keeps "
-                         "dropping.")
-    tr.add_argument("--max-seq-len", dest="max_seq_len", type=int, default=None,
-                    help="max training sequence length in tokens (default: "
-                         "cfg.context_length from the model config). Set "
-                         "this explicitly if your data has longer traces "
-                         "than the model's configured context_length -- e.g. "
-                         "OpenThoughts traces commonly run 6-8k tokens "
-                         "against a 4096 context_length, which silently "
-                         "truncates every long example. NOTE: this only "
-                         "changes what the training script feeds the model; "
-                         "if you go above context_length, plan to update "
-                         "cfg.context_length in modeling_nanity.py and the "
-                         "KV-cache sizing in NEON.cpp to match at export/"
-                         "inference time, or the exported GGUF metadata "
-                         "will undersell what the checkpoint can actually do.")
-    tr.add_argument("--tokenize-workers", dest="tokenize_workers", type=int, default=None,
-                    help="thread count for ConversationDataset's tokenization "
-                         "pass over --data/--val-data (default: min(32, cpu "
-                         "count)). These are threads, not processes -- the "
-                         "fast HF tokenizer releases the GIL during encode(), "
-                         "so this parallelizes real CPU work without the "
-                         "/dev/shm / semaphore fragility that ruled out "
-                         "multiprocessing.Pool on some rented cloud "
-                         "containers. Lower this if you're tokenizing "
-                         "alongside other CPU-heavy work on the same box.")
-
-    # -- sequence packing -----------------------------------------------------
-    tr.add_argument("--pack-sequences", dest="pack_sequences", action="store_true",
-                    help="concatenate examples end-to-end into fixed-length "
-                         "max_len rows instead of separately right-padding "
-                         "each one per batch. Big win when example lengths "
-                         "vary a lot (reasoning-trace SFT data, or the short "
-                         "trailing chunk of each pretrain document) since "
-                         "collate_fn otherwise pads every row in a batch out "
-                         "to its longest member. TRADE-OFF: packed rows are "
-                         "NOT isolated with a block-diagonal attention mask, "
-                         "so a token can attend across the boundary into the "
-                         "previous example packed into the same row -- see "
-                         "pack_examples() in nanity_data_format.py for why "
-                         "(this is what keeps the SDPA is_causal fast path "
-                         "intact). Off by default since it changes the data "
-                         "distribution/step-to-step loss trajectory versus a "
-                         "checkpoint trained without it -- don't flip this on "
-                         "mid-run and expect loss curves to line up.")
-
-    # -- vocab freezing (large vocab_size, English-only training data) -------
-    tr.add_argument("--freeze-unseen-vocab", dest="freeze_unseen_vocab",
-                    action="store_true",
-                    help="pin the embedding/LM-head rows (tied) for every "
-                         "vocab id that never appears anywhere in --data to "
-                         "their random init -- their gradient is zeroed "
-                         "every step, before weight decay too. Without this, "
-                         "cross-entropy's softmax normalization still pushes "
-                         "every non-target row's logit down a little at "
-                         "every position, so 'unused' multilingual rows in a "
-                         "large vocab slowly get suppressed toward 'never "
-                         "predict this' even on English-only data, instead "
-                         "of staying neutral for a future language to claim. "
-                         "This flag keeps them genuinely untouched. Only "
-                         "affects token_embd (and output.weight if "
-                         "tie_embeddings=False); has no effect under "
-                         "--lora-rank > 0, since LoRA already freezes "
-                         "embeddings entirely.")
-
-    # -- export mode ---------------------------------------------------------
-    tr.add_argument("--export",  help="checkpoint to export to GGUF (skip training)")
-    tr.add_argument("--gguf",    help="output GGUF path (used with --export)")
-    tr.add_argument("--lora-checkpoint", dest="lora_checkpoint",
-                    help="LoRA adapter .pt to merge into --export's base checkpoint "
-                         "before writing GGUF (requires --export to point at the base)")
-
-    args = ap.parse_args()
-
-    # export-only shortcut
-    if args.export:
-        if not args.gguf:
-            ap.error("--export requires --gguf")
-        # Prefer an existing donor GGUF if given; otherwise build the
-        # tokenizer keys fresh from the HF tokenizer (default: Phi-4-mini-
-        # instruct). You do NOT need an existing NANITY GGUF to export.
-        export_gguf(args.export, args.gguf,
-                    tokenizer_source_gguf=args.tokenizer_gguf,
-                    tokenizer_hf=None if args.tokenizer_gguf else args.tokenizer,
-                    quant=args.export_quant,
-                    lora_checkpoint=args.lora_checkpoint)
-        return
-
-    if not args.data:
-        ap.error("--data is required for training")
-
-    train(args)
-
-
-if __name__ == "__main__":
-    main()
+        with open(path, "rb") as f:
+            return f.read(len(MAGIC)) == MAGIC
+    except OSError:
+        return False
